@@ -109,7 +109,7 @@ D3DMETAL_LICENSE = ("D3DMetal is Apple's, from the Game Porting Toolkit. Apple's
                     "to develop, test or evaluate games on Apple hardware, and forbids modifying or redistributing it.")
 
 CATALOG = {
-    "Steam": {"url": "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe", "file": "SteamSetup.exe", "engine": "wine"},
+    "Steam": {"url": "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe", "file": "SteamSetup.exe", "engine": "wine", "args": ["/S"]},
     "Epic Games Launcher": {"url": "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi",
                             "file": "EpicGamesLauncherInstaller.msi", "engine": "wine"},
     "Battle.net": {"url": "https://www.battle.net/download/getInstallerForGame?os=win&gameProgram=BATTLENET_APP&version=Live",
@@ -387,6 +387,8 @@ def engine_env(name, target=None):
             env["WINEDLLPATH_PREPEND"] = str(ARM / "renderers" / layer / "wine")
         if layer == "vkd3d":  # MoltenVK reports neither feature level nor shader model honestly: declare D3DMetal's
             overrides.append("dxgi,d3d11,d3d10core,d3d12,d3d12core=n,b")
+            # vkd3d won't create its cache folder ("Failed to open stream archive write file") and recompiles every run
+            (HOME / name / "drive_c/vkd3d-cache/arm64-wine11.18-r1").mkdir(parents=True, exist_ok=True)
             env.update(VKD3D_RELAX_DEVICE_CAPS="1", VKD3D_FEATURE_LEVEL="12_0", VKD3D_SHADER_MODEL="6_6",
                        VKD3D_SHADER_CACHE_PATH="C:\\vkd3d-cache\\arm64-wine11.18-r1")  # per engine build, in the bottle
         elif layer == "dxvk":
@@ -600,7 +602,8 @@ def run(name, exe, *args, wait=True):
         exe, args = "steam.exe", ("-applaunch", appid, *args)
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
         fix_steam(name)
-        exe, args = str(steam), ("-noverifyfiles", *args)
+        # ...but not before Steam's first update: with the flag, a fresh install shows "Fatal Error" and stops
+        exe, args = str(steam), (("-noverifyfiles",) if (steam.parent / "steamui.dll").exists() else ()) + tuple(args)
     low = exe.lower()
     cmd = ([w, "msiexec", "/i", exe] if low.endswith(".msi") else
            [w, "start", "/unix", exe] if low.endswith(".lnk") else [w, exe])
@@ -735,8 +738,8 @@ def install(name, item):
     if os.path.exists(item):
         return install_file(name, item)
     e = catalog().get(item) or sys.exit(f"unknown item {item!r}; see: python3 portal.py catalog")
-    if e.get("engine") and e["engine"] != engine(name):  # modern launchers crash on GPTK's Wine 7.7
-        sys.exit(f"{item} needs a {ENGINE_NAMES[e['engine']]} bottle; {name} uses {ENGINE_NAMES[engine(name)]}.")
+    if e.get("engine") and engine(name) == "gptk":  # modern launchers crash on GPTK's Wine 7.7; newer engines are fine
+        sys.exit(f"{item} needs a newer engine than {name}'s {ENGINE_NAMES['gptk']}; use a Wine 10, Wine 11 or native bottle.")
     before = programs(name)
     if e.get("tricks"):
         tricks(name, "-q", *e["tricks"])
@@ -1642,7 +1645,8 @@ def mac_app(name, target, title=None):
         (DATA / "steamwebhelper.exe").write_bytes(WEBHELPER)
         w, d = shlex.quote(str(DATA / "steamwebhelper.exe")), shlex.quote(str(steam.parent / "bin/cef/cef.win64"))
         fix = f'cmp -s {w} {d}/steamwebhelper.exe || {{ mv -f {d}/steamwebhelper.exe {d}/steamwebhelper_real.exe && cp {w} {d}/steamwebhelper.exe; }}\n'
-        launch = f"{shlex.quote(str(steam))} -noverifyfiles" + (f" -applaunch {appid}" if appid else "")
+        ui_dll = shlex.quote(str(steam.parent / "steamui.dll"))  # checked at each launch: fresh installs need the update
+        launch = f"{shlex.quote(str(steam))} $([ -f {ui_dll} ] && echo -noverifyfiles)" + (f" -applaunch {appid}" if appid else "")
     if hit := launcher_app_of(name, target):  # via Legendary/Nile for the login token, so through this script
         me = shlex.quote(sys.executable) + ("" if FROZEN else " " + shlex.quote(str(Path(__file__).resolve())))
         script.write_text(f"#!/bin/sh\nexec {me} store play {hit[0]} {shlex.quote(hit[1])}\n")
@@ -1933,12 +1937,17 @@ def gui():
              highlightthickness=1, highlightbackground=HOVER, highlightcolor=ACCENT).pack(side="right", ipady=5)
     tk.Label(top, text="Search", bg=BG, fg=DIM).pack(side="right", padx=8)
     sort_by = tk.StringVar(value=prefs.get("sort", "Name A–Z"))
-    show_only = tk.StringVar(value="All")
     sort_menu = tk.OptionMenu(top, sort_by, "Name A–Z")
-    show_menu = tk.OptionMenu(top, show_only, "All")
-    for m in (show_menu, sort_menu):
-        m.configure(bg=BG, highlightthickness=0, width=14)
+    # Filters are checkboxes that stack: within a group a game passes if any ticked box fits it (Installed or Not
+    # installed), across groups it must pass each group (has a Mac version AND not installed).
+    filter_button = tk.Menubutton(top, text="Filters", bg=BG, relief="raised", width=12)
+    filter_menu = tk.Menu(filter_button, tearoff=False)
+    filter_button["menu"] = filter_menu
+    filters = {}  # label -> BooleanVar, kept across views so a tick survives switching back
+    for m in (filter_button, sort_menu):
+        m.configure(highlightthickness=0)
         m.pack(side="right", padx=4)
+    sort_menu.configure(bg=BG, width=14)
     tk.Label(top, text="Sort", bg=BG, fg=DIM).pack(side="right", padx=(16, 0))
 
     def set_options(menu, var, options):
@@ -1957,7 +1966,20 @@ def gui():
             pass
         state.get("drawing") or draw()
     sort_by.trace_add("write", saved_sort)
-    show_only.trace_add("write", lambda *_: state.get("drawing") or draw())
+
+    def set_filters(groups):
+        """groups: [[(label, predicate), ...], ...]; rebuilds the menu and returns the stacked predicate."""
+        filter_menu.delete(0, "end")
+        for gi, opts in enumerate(groups):
+            if gi:
+                filter_menu.add_separator()
+            for label, _ in opts:
+                filter_menu.add_checkbutton(label=label, variable=filters.setdefault(label, tk.BooleanVar(value=False)),
+                                            command=lambda: state.get("drawing") or draw())
+        on = [[p for label, p in opts if filters[label].get()] for opts in groups]
+        n = sum(map(len, on))
+        filter_button.config(text=f"Filters ({n})" if n else "Filters")
+        return lambda i: all(any(p(i) for p in ps) for ps in on if ps)
     detail = tk.Frame(main, bg=SIDE, height=120)
     detail.pack(side="bottom", fill="x")
     detail.pack_propagate(False)
@@ -2081,19 +2103,21 @@ def gui():
         if store:
             items = store_items(store)
             heading.config(text=STORES[store])
-            set_options(show_menu, show_only, ["All", "Has Mac version", "Installed", "Not installed"])
             set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Installed first"])
-            keep = {"Installed": lambda i: i[2][3].get("installed") or i[2][3].get("mac_installed"),
-                    "Not installed": lambda i: not (i[2][3].get("installed") or i[2][3].get("mac_installed")),
-                    "Has Mac version": lambda i: i[2][3].get("mac")}
+            have = lambda i: i[2][3].get("installed") or i[2][3].get("mac_installed")
+            keep = set_filters([[("Has Mac version", lambda i: i[2][3].get("mac")),
+                                 ("No Mac version", lambda i: not i[2][3].get("mac"))],
+                                [("Installed", have), ("Not installed", lambda i: not have(i))]])
         else:
             items = [i for i in state["items"] if state["filter"] in (None, i[1])]
             heading.config(text=state["filter"] or "All Programs")
             engines = sorted({ENGINE_NAMES.get(engine(b), engine(b)) for b in {i[1] for i in items}})
-            set_options(show_menu, show_only, ["All", *engines])
             set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Bottle"])
-            keep = {e: (lambda i, e=e: ENGINE_NAMES.get(engine(i[1]), engine(i[1])) == e) for e in engines}
-        shown = [i for i in items if q in str(i[0]).lower() and keep.get(show_only.get(), bool)(i)]
+            mac = state.get("steam_mac", set())
+            has_mac = lambda i: steam_appid_of(i[1], i[0]) in mac
+            keep = set_filters([[(e, lambda i, e=e: ENGINE_NAMES.get(engine(i[1]), engine(i[1])) == e) for e in engines],
+                                [("Has Mac version", has_mac), ("No Mac version", lambda i: not has_mac(i))]])
+        shown = [i for i in items if q in str(i[0]).lower() and keep(i)]
         name = lambda i: str(i[0]).lower()
         order = sort_by.get()
         if order == "Name Z–A":
