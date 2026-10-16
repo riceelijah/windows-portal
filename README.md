@@ -75,7 +75,7 @@ Display profiles, per-game mouse settings and Steam repair are adapted from
 
 `python3 portal.py get-engine arm64` (or Manage Bottles → Get Native Engine…) installs
 [Highball](https://github.com/gauthierpiarrette/highball)'s native Wine for Apple Silicon. Windows programs run through
-FEX instead of Rosetta, which Apple is winding down after macOS 27. It needs an Apple Silicon Mac with macOS 15 or later
+FEX instead of Rosetta, which Apple is winding down after macOS 27. It needs an Apple Silicon Mac with macOS 26.5 or later
 and **Highball installed**: its Wine loader needs an Apple entitlement only a signed app can carry, so Windows Portal
 borrows the signed loader inside Highball.app (or the one `WINDOWSPORTAL_WINELOADER` names).
 
