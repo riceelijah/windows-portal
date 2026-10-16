@@ -38,6 +38,7 @@
   python3 portal.py store list STORE             # steam, epic, gog, itch or amazon: everything you own
   python3 portal.py store install STORE ID NAME  # install a game you own into bottle NAME
   python3 portal.py store play STORE ID
+  python3 portal.py store mac STORE ID           # get or play the game's native Mac version (steam, epic, gog, itch)
   python3 portal.py import ARCHIVE
   python3 portal.py delete NAME
 
@@ -1106,12 +1107,14 @@ def store_logout(store):
 def store_list(store, refresh=True):
     """{id: {"title", "installed": bottle or None, ...}} of everything the account owns; cached for offline use."""
     if store == "steam":  # read from disk, so always fresh
-        games = {}
+        games, on_mac = {}, mac_steam_installed()
         for b in bottles():
             installed = {a for a, *_ in steam_games(b)} if (steam_root(b) / "steamapps").is_dir() else set()
+            mac = steam_mac_ids(b)
             for appid, title in steam_owned(b).items():
                 if appid not in games or appid in installed:  # owned in several bottles: the one it's installed in
-                    games[appid] = {"title": title, "bottle": b, "installed": b if appid in installed else None}
+                    games[appid] = {"title": title, "bottle": b, "installed": b if appid in installed else None,
+                                    "mac": appid in mac, "mac_installed": appid in on_mac}
         return games
     if not refresh or not store_connected(store):
         return store_file(f"{store}-library.json")
@@ -1144,6 +1147,50 @@ def store_install(store, gid, name):
     return added
 
 
+MAC_GAMES = Path.home() / "Games"  # where Mac versions Windows Portal installs itself go (Epic)
+
+
+def store_mac(store, gid):
+    """Gets or plays the game's native Mac version through that store's own Mac route. Returns a message."""
+    gid = str(gid)
+    g = store_list(store, refresh=False).get(gid) or sys.exit(f"unknown {store} game {gid}")
+    if not g.get("mac"):
+        sys.exit(f"{g['title']} has no Mac version on {STORES[store]}")
+    if store == "steam":
+        if g.get("mac_installed"):
+            subprocess.run(["open", f"steam://rungameid/{gid}"])
+            return f"Starting {g['title']} in Steam for Mac"
+        if mac_steam_app():
+            subprocess.run(["open", f"steam://install/{gid}"])
+            return f"Steam for Mac is installing {g['title']}"
+        subprocess.run(["open", "https://store.steampowered.com/about/"])
+        return "Install Steam for Mac from the page that just opened, sign in, then choose Get Mac Version again"
+    if store == "epic":
+        if g.get("mac_installed"):
+            legendary("launch", gid, "--skip-version-check")
+            return f"Starting {g['title']}"
+        (MAC_GAMES / "Epic").mkdir(parents=True, exist_ok=True)
+        legendary("install", gid, "--platform", "Mac", "--base-path", str(MAC_GAMES / "Epic"), "-y", "--skip-sdl", stream=True)
+        games = store_list("epic", refresh=False)
+        games.setdefault(gid, g)["mac_installed"] = True
+        store_file("epic-library.json", games)
+        return f"Installed the Mac version of {g['title']} in {MAC_GAMES / 'Epic'}"
+    if store == "gog":
+        d = http_json(f"https://embed.gog.com/account/gameDetails/{gid}.json", gog_auth())
+        langs = {lang: files for lang, files in d.get("downloads", [])}
+        files = (langs.get("English") or next(iter(langs.values()), {})).get("mac")
+        if not files:
+            sys.exit("GOG has no Mac installer for this game")
+        parts = [fetch_authed(f"https://embed.gog.com{f['manualUrl']}", gog_auth(), CACHE / "gog-mac" / gid) for f in files]
+        pkg = next((p for p in parts if p.suffix.lower() in (".pkg", ".dmg")), parts[0])
+        subprocess.run(["open", str(pkg)])  # macOS's own Installer (or the disk image) takes it from here
+        return f"Opened the Mac installer for {g['title']}"
+    if store == "itch":
+        subprocess.run(["open", g.get("url") or f"https://itch.io/search?q={urllib.parse.quote(g['title'])}"])
+        return f"Opened {g['title']} on itch.io; download the macOS build there"
+    sys.exit(f"{STORES[store]} has no Mac versions")
+
+
 def store_play(store, gid):
     gid = str(gid)
     g = store_list(store, refresh=False).get(gid) or {}
@@ -1170,7 +1217,38 @@ def steam_owned(name):
     cache = steam_root(name) / "appcache/librarycache"
     ids = {int(m.group()) for p in cache.iterdir() if (m := re.match(r"\d+", p.name))} if cache.is_dir() else set()
     info = steam_appinfo(steam_root(name) / "appcache/appinfo.vdf", ids) if ids else {}
-    return {str(a): t for a, (t, kind) in sorted(info.items(), key=lambda i: str(i[1][0]).lower()) if kind == "game" and t}
+    return {str(a): t for a, (t, kind, _) in sorted(info.items(), key=lambda i: str(i[1][0]).lower()) if kind == "game" and t}
+
+
+def steam_mac_ids(name):
+    """App ids, among what a bottle's Steam has seen, that Steam lists for macOS."""
+    cache = steam_root(name) / "appcache/librarycache"
+    ids = {int(m.group()) for p in cache.iterdir() if (m := re.match(r"\d+", p.name))} if cache.is_dir() else set()
+    info = steam_appinfo(steam_root(name) / "appcache/appinfo.vdf", ids) if ids else {}
+    return {str(a) for a, (_, _, oslist) in info.items() if "macos" in oslist}
+
+
+MAC_STEAM = Path.home() / "Library/Application Support/Steam"  # the native Mac Steam client's data
+
+
+def mac_steam_app():
+    return next((p for p in (Path("/Applications/Steam.app"), Path.home() / "Applications/Steam.app") if p.exists()), None)
+
+
+def mac_steam_installed():
+    """App ids the native Mac Steam client has fully installed, in any of its library folders."""
+    root = MAC_STEAM / "steamapps"
+    libs = {root} | ({Path(v) / "steamapps" for k, v in vdf_pairs(root / "libraryfolders.vdf") if k == "path"}
+                     if (root / "libraryfolders.vdf").exists() else set())
+    out = set()
+    for lib in libs:
+        for acf in lib.glob("appmanifest_*.acf"):
+            d = {}
+            for k, v in vdf_pairs(acf):
+                d.setdefault(k, v)
+            if int(d.get("StateFlags", 0)) & 4:
+                out.add(d.get("appid"))
+    return out
 
 
 def steam_appinfo(path, wanted):
@@ -1231,8 +1309,16 @@ def _appinfo(b, wanted):
         if appid in wanted:
             try:  # skip state, update time, token, hashes and change number (60 bytes) to the KeyValues
                 root, _ = obj(start + 60)
-                common = root.get("appinfo", root).get("common", {})
-                apps[appid] = (common.get("name"), str(common.get("type", "")).lower())
+                ai = root.get("appinfo", root)
+                common = ai.get("common", {})
+                oslist = str(common.get("oslist", "")).lower()
+                mac_exes = [str(v.get("executable", "")) for v in ((ai.get("config") or {}).get("launch") or {}).values()
+                            if isinstance(v, dict) and "macos" in str((v.get("config") or {}).get("oslist", ""))]
+                # ponytail: Valve's old Source games (Portal, Half-Life 2...) still list macos but only ship a 32-bit
+                # build, started by a .sh script, that no macOS since Catalina runs; anything else listed is trusted.
+                if mac_exes and all(e.endswith(".sh") for e in mac_exes) and str(common.get("osarch", "")) != "64":
+                    oslist = oslist.replace("macos", "")
+                apps[appid] = (common.get("name"), str(common.get("type", "")).lower(), oslist)
             except (ValueError, IndexError, struct.error, AttributeError):
                 pass  # one odd entry shouldn't hide the rest of the library
     return apps
@@ -1275,7 +1361,10 @@ def epic_installed():
 def epic_list():
     where = {app: next((b for b in bottles() if str(Path(path).resolve()).startswith(f"{(HOME / b / 'drive_c').resolve()}/")), None)
              for app, (path, _) in epic_installed().items()}
-    return {g["app_name"]: {"title": g.get("app_title") or g["app_name"], "installed": where.get(g["app_name"])}
+    mac = {g["app_name"] for g in legendary_json("list", "--platform", "Mac", "--json") or []}
+    mac_done = {app for app, (path, _) in epic_installed().items() if not where.get(app)}  # installed outside any bottle
+    return {g["app_name"]: {"title": g.get("app_title") or g["app_name"], "installed": where.get(g["app_name"]),
+                            "mac": g["app_name"] in mac, "mac_installed": g["app_name"] in mac_done}
             for g in legendary_json("list", "--platform", "Windows", "--json") or []}
 
 
@@ -1332,7 +1421,8 @@ def gog_list():
         d = http_json(f"https://embed.gog.com/account/getFilteredProducts?mediaType=1&page={page}", gog_auth())
         pages, page = d.get("totalPages", 1), page + 1
         for g in d.get("products", []):
-            games[str(g["id"])] = {"title": g.get("title", g["id"]), "windows": (g.get("worksOn") or {}).get("Windows", True)}
+            games[str(g["id"])] = {"title": g.get("title", g["id"]), "windows": (g.get("worksOn") or {}).get("Windows", True),
+                                   "mac": bool((g.get("worksOn") or {}).get("Mac"))}
     return games
 
 
@@ -1357,6 +1447,10 @@ def itch_windows(o):  # the API has said "windows" three ways over the years
     return bool(o.get("p_windows") or "p_windows" in (o.get("traits") or []) or (o.get("platforms") or {}).get("windows"))
 
 
+def itch_mac(o):
+    return bool(o.get("p_osx") or "p_osx" in (o.get("traits") or []) or (o.get("platforms") or {}).get("osx"))
+
+
 def itch_list():
     games = {}
     for page in range(1, 200):
@@ -1365,7 +1459,8 @@ def itch_list():
             break
         for k in keys:
             g = k.get("game") or {}
-            games[str(k["id"])] = {"title": g.get("title", "?"), "game_id": k.get("game_id", g.get("id")), "windows": itch_windows(g)}
+            games[str(k["id"])] = {"title": g.get("title", "?"), "game_id": k.get("game_id", g.get("id")), "windows": itch_windows(g),
+                                   "mac": itch_mac(g), "url": g.get("url")}
     return games
 
 
@@ -1518,9 +1613,12 @@ def store_cli(cmd, *a):
         store_logout(*a)
     elif cmd == "list":
         for gid, g in store_list(*a).items():
-            print(f"{gid}\t{g['title']}" + (f"\t(installed in {g['installed']})" if g.get("installed") else ""))
+            print(f"{gid}\t{g['title']}" + ("\t[Mac]" if g.get("mac") else "") +
+                  (f"\t(installed in {g['installed']})" if g.get("installed") else ""))
     elif cmd == "install":
         print(store_install(*a))
+    elif cmd == "mac":
+        print(store_mac(*a))
     elif cmd == "play":
         p = store_play(*a)
         if hasattr(p, "wait"):
@@ -1898,6 +1996,10 @@ def gui():
             except (SystemExit, Exception) as e:
                 ui(status.set, f"Steam games: {e}")
             items = [(t, b, p, icon_png(b, p, 128)) for b in bottles() for t, p in programs(b).items()]
+            try:
+                state["steam_mac"] = {a for a, g in store_list("steam").items() if g.get("mac")}
+            except (SystemExit, Exception):
+                pass
             ui(loaded, items)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1952,9 +2054,11 @@ def gui():
                     if got and (i % 8 == 0 or i == len(missing)):
                         ui(lambda: store_view() == store and draw())
             threading.Thread(target=fetch_art, daemon=True).start()
-        return [(g["title"], f"Installed in {g['installed']}" if g.get("installed") else
-                 ("Not installed" if g.get("windows", True) else "No Windows version"), ("store", store, gid, g), arts[gid])
-                for gid, g in ordered]
+        def status_of(g):
+            win = (f"Installed in {g['installed']}" if g.get("installed") else
+                   "Not installed" if g.get("windows", True) else "No Windows version")
+            return ("Mac · installed" if g.get("mac_installed") else f"Mac version · {win}") if g.get("mac") else win
+        return [(g["title"], status_of(g), ("store", store, gid, g), arts[gid]) for gid, g in ordered]
 
     def key_of(item):
         target = item[2]
@@ -1977,9 +2081,11 @@ def gui():
         if store:
             items = store_items(store)
             heading.config(text=STORES[store])
-            set_options(show_menu, show_only, ["All", "Installed", "Not installed"])
+            set_options(show_menu, show_only, ["All", "Has Mac version", "Installed", "Not installed"])
             set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Installed first"])
-            keep = {"Installed": lambda i: i[2][3].get("installed"), "Not installed": lambda i: not i[2][3].get("installed")}
+            keep = {"Installed": lambda i: i[2][3].get("installed") or i[2][3].get("mac_installed"),
+                    "Not installed": lambda i: not (i[2][3].get("installed") or i[2][3].get("mac_installed")),
+                    "Has Mac version": lambda i: i[2][3].get("mac")}
         else:
             items = [i for i in state["items"] if state["filter"] in (None, i[1])]
             heading.config(text=state["filter"] or "All Programs")
@@ -2075,6 +2181,8 @@ def gui():
             pass
         if isinstance(target, tuple):  # a store game
             _, store, gid, g = target
+            if g.get("mac") and (g.get("mac_installed") or not g.get("installed")):  # native beats Wine
+                return get_mac(item)
             if not g.get("installed"):
                 return install_store_game(item)
             bg(f"Starting {title}…", store_play, store, gid)
@@ -2087,6 +2195,28 @@ def gui():
         run(b, target, wait=False)
         status.set(f"Launched {title}")
         root.after(4000, lambda: status.get() == f"Launched {title}" and status.set(""))
+
+    def run_windows(item):  # the store game's Windows version, even when a Mac one exists
+        title, _, (_, store, gid, g), _ = item
+        bg(f"Starting {title}…", store_play, store, gid)
+
+    def get_mac(item):
+        title, _, (_, store, gid, g), _ = item
+
+        def work():
+            msg = store_mac(store, gid)
+            ui(status.set, "")
+            ui(messagebox.showinfo, "Windows Portal", msg)
+        status.set(f"{title}: Mac version…")
+        state["store_fetched"].discard(store)  # pick up mac_installed afterwards
+
+        def run_it():
+            try:
+                work()
+            except (SystemExit, Exception) as e:
+                ui(messagebox.showerror, "Windows Portal", str(e))
+            ui(draw)
+        threading.Thread(target=run_it, daemon=True).start()
 
     def install_store_game(item):
         title, _, (_, store, gid, g), _ = item
@@ -2193,10 +2323,17 @@ def gui():
             tk.Label(info, text=f"{STORES[store]}  ·  {b}", bg=SIDE, fg=DIM).pack(anchor="w")
             bar = tk.Frame(detail, bg=SIDE)
             bar.pack(side="right", padx=24)
+            mac_first = g.get("mac") and (g.get("mac_installed") or not g.get("installed"))
+            if g.get("mac"):
+                button(bar, "▶  Play on Mac" if g.get("mac_installed") else "Get Mac Version",
+                       lambda: get_mac(item), mac_first).pack(side="left", padx=4)
             if g.get("installed"):
-                button(bar, "▶  Play", lambda: play(item), True).pack(side="left", padx=4)
+                button(bar, "▶  Play Windows Version" if g.get("mac") else "▶  Play", lambda: run_windows(item),
+                       not mac_first).pack(side="left", padx=4)
             elif g.get("windows", True):
-                button(bar, "Install…" if store != "steam" else "Install in Steam", lambda: install_store_game(item), True).pack(side="left", padx=4)
+                button(bar, ("Install Windows Version…" if g.get("mac") else "Install…") if store != "steam" else
+                       ("Install Windows Version in Steam" if g.get("mac") else "Install in Steam"),
+                       lambda: install_store_game(item), not mac_first).pack(side="left", padx=4)
 
             def find_appid():  # umu matches other stores' games to Steam's, which Highball's database is keyed on
                 appid = umu_appid(store, gid)
@@ -2209,11 +2346,16 @@ def gui():
             tk.Label(info, text="This game: " + ", ".join(f"{k} {v}" for k, v in own.items()), bg=SIDE, fg=DIM).pack(anchor="w")
         if appid := steam_appid_of(b, title):
             verdict_label(info, appid, b)
+            if appid in state.get("steam_mac", ()):
+                tk.Label(info, text="Has a Mac version on Steam", bg=SIDE, fg="#7fd88f").pack(anchor="w")
         bar = tk.Frame(detail, bg=SIDE)
         bar.pack(side="right", padx=24)
         added = title in library().get(b, {})
         files = target if not target.lower().endswith(".lnk") else str(win_to_mac(b, lnk_target(target) or "C:\\"))
-        for text, fn, acc in [("▶  Play", lambda: play(item), True),
+        if appid and appid in state.get("steam_mac", ()):
+            button(bar, "Get Mac Version", lambda: bg(f"{title}: Mac version…", lambda: ui(messagebox.showinfo, "Windows Portal", store_mac("steam", appid))),
+                   True).pack(side="left", padx=4)
+        for text, fn, acc in [("▶  Play", lambda: play(item), not (appid and appid in state.get("steam_mac", ()))),
                               ("Game Settings…", lambda: game_settings_dialog(b, target, title), False),
                               ("Make Mac App", lambda: messagebox.showinfo("Windows Portal", f"Created {mac_app(b, target, title)}"), False),
                               ("Show Files", lambda: subprocess.run(["open", "-R", files]), False),
