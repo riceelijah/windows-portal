@@ -70,3 +70,18 @@ Epic's in `…/WindowsPortal/legendary`. Disconnect removes them.
 
 Display profiles, per-game mouse settings and Steam repair are adapted from
 [Mac Wine Launcher](https://github.com/MrBurge2000/mac-wine-launcher) (MIT).
+
+## Native Apple Silicon engine (preview, optional)
+
+`python3 portal.py get-engine arm64` (or Manage Bottles → Get Native Engine…) installs
+[Highball](https://github.com/gauthierpiarrette/highball)'s native Wine for Apple Silicon. Windows programs run through
+FEX instead of Rosetta, which Apple is winding down after macOS 27. It needs an Apple Silicon Mac with macOS 15 or later
+and **Highball installed**: its Wine loader needs an Apple entitlement only a signed app can carry, so Windows Portal
+borrows the signed loader inside Highball.app (or the one `WINDOWSPORTAL_WINELOADER` names).
+
+- Graphics are `vkd3d` (DirectX 10–12, the default), `dxvk` (DirectX 10–11) and `wined3d`. No D3DMetal or DXMT, so
+  many games run slower than on `wine10` today.
+- Make a new bottle for it (`python3 portal.py new NAME win10 arm64`); bottles don't convert between it and the Intel
+  engines. `python3 portal.py copy-games OLD NEW` clones `C:\Games` across without using extra disk.
+
+The plan for shipping Windows Portal's own signed loader is in [docs/arm64-engine-plan.md](docs/arm64-engine-plan.md).
