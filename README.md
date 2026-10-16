@@ -84,4 +84,6 @@ borrows the signed loader inside Highball.app (or the one `WINDOWSPORTAL_WINELOA
 - Make a new bottle for it (`python3 portal.py new NAME win10 arm64`); bottles don't convert between it and the Intel
   engines. `python3 portal.py copy-games OLD NEW` clones `C:\Games` across without using extra disk.
 
-The plan for shipping Windows Portal's own signed loader is in [docs/arm64-engine-plan.md](docs/arm64-engine-plan.md).
+A release build of Windows Portal.app carries its own signed loader instead: `scripts/build-app.sh` bundles Python,
+builds the loader from `helper/wineloader` (Wine's, LGPL), signs and notarizes. Setup is in
+[docs/signing.md](docs/signing.md), the reasoning in [docs/arm64-engine-plan.md](docs/arm64-engine-plan.md).

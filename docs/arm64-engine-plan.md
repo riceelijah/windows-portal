@@ -1,6 +1,8 @@
 # Plan: a native Apple Silicon engine
 
-Status: October 2026. Option A is built (`get-engine arm64`, opt-in preview); option B is not.
+Status: October 2026. Option A is built (`get-engine arm64`, opt-in preview). Option B is scaffolded on the
+`native-signed-loader` branch (`helper/wineloader`, `scripts/build-app.sh`, `docs/signing.md`) and waits on an
+Apple Developer account and a first signed build.
 
 ## Why
 

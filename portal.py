@@ -60,11 +60,15 @@ WINE_SHA256 = "aa0ea4c82e636ae7bca2076387cb0a5affa26509ad13f119ecd0d62bd7ba6f82"
 # layers (DXMT, D3DMetal, DXVK). Plain WineHQ builds lack the Mac driver hooks DXMT and D3DMetal need, and msync.
 SIK = DATA / "engines/sikarugir-10.0_6"
 # Preview: Highball's native Apple Silicon Wine (WineHQ 11.18 for arm64; x86 programs run through FEX, not Rosetta).
-# Its loader needs Apple's cross-architecture entitlement, which only a signed app can carry, so it runs through the
-# signed WineLoader helper inside Highball.app (docs/arm64-engine-plan.md, option A).
+# Its loader needs Apple's cross-architecture entitlement, which only a signed app can carry: the one built into
+# Windows Portal.app by scripts/build-app.sh (helper/wineloader), else the one inside Highball.app
+# (docs/arm64-engine-plan.md, options B and A).
 ARM = DATA / "engines/arm64-wine11.18-r1"
+FROZEN = getattr(sys, "frozen", False)  # running as the app scripts/build-app.sh makes
+OWN_WINELOADER = Path(sys.executable).parents[1] / "Helpers/WineLoader.app/Contents/MacOS/wine" if FROZEN else None
 WINELOADER_PATHS = [Path(os.environ["WINDOWSPORTAL_WINELOADER"])] if os.environ.get("WINDOWSPORTAL_WINELOADER") else [
-    Path(a) / "Highball.app/Contents/Helpers/WineLoader.app/Contents/MacOS/wine" for a in ("/Applications", Path.home() / "Applications")]
+    *([OWN_WINELOADER] if OWN_WINELOADER else []),
+    *(Path(a) / "Highball.app/Contents/Helpers/WineLoader.app/Contents/MacOS/wine" for a in ("/Applications", Path.home() / "Applications"))]
 ENGINES = {  # per bottle
     "wine10": SIK / "wswine.bundle/bin/wine",
     "arm64": ARM / "engine/bin/wine",
@@ -288,8 +292,16 @@ def wine(name):
 
 
 def wineloader():
-    """The signed Wine loader in Highball.app, or None."""
-    return next((p for p in WINELOADER_PATHS if p.is_file()), None)
+    """The first signed Wine loader that can run the native engine, or None."""
+    return next((p for p in WINELOADER_PATHS if p.is_file() and (p != OWN_WINELOADER or entitled(p))), None)
+
+
+def entitled(loader):
+    """Whether a loader carries the cross-architecture entitlement. A development build of Windows Portal.app (no
+    provisioning profile) has a helper without it, which can't run x86 code; Highball's is then the fallback."""
+    out = subprocess.run(["codesign", "-d", "--entitlements", "-", "--xml", str(loader.parents[2])],
+                         capture_output=True, text=True).stdout
+    return "cross-architecture-support" in out
 
 
 def arm64_missing():
@@ -300,8 +312,8 @@ def arm64_missing():
     if tuple(int(x) for x in ((platform.mac_ver()[0] or "0") + ".0").split(".")[:2]) < (26, 5):
         return "the native engine needs macOS 26.5 or later"
     if not wineloader():
-        return ("the native engine needs Highball's signed Wine loader: install Highball (gethighball.com), "
-                "or set WINDOWSPORTAL_WINELOADER to a signed loader")
+        return ("the native engine needs a signed Wine loader: use a release build of Windows Portal.app, install Highball "
+                "(gethighball.com), or set WINDOWSPORTAL_WINELOADER to a signed loader")
     return None
 
 
@@ -1534,8 +1546,8 @@ def mac_app(name, target, title=None):
         fix = f'cmp -s {w} {d}/steamwebhelper.exe || {{ mv -f {d}/steamwebhelper.exe {d}/steamwebhelper_real.exe && cp {w} {d}/steamwebhelper.exe; }}\n'
         launch = f"{shlex.quote(str(steam))} -noverifyfiles" + (f" -applaunch {appid}" if appid else "")
     if hit := launcher_app_of(name, target):  # via Legendary/Nile for the login token, so through this script
-        script.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} "
-                          f"store play {hit[0]} {shlex.quote(hit[1])}\n")
+        me = shlex.quote(sys.executable) + ("" if FROZEN else " " + shlex.quote(str(Path(__file__).resolve())))
+        script.write_text(f"#!/bin/sh\nexec {me} store play {hit[0]} {shlex.quote(hit[1])}\n")
     else:
         script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(Path(target).parent))}\n{fix}"
                           f"export {exports}\nexec {shlex.quote(wine(name))} start /unix {launch}\n")
@@ -1690,7 +1702,10 @@ def import_(archive):
 
 
 def package(dest=Path.home() / "Applications"):
-    """Builds Windows Portal.app around this script and the Python running it."""
+    """Builds Windows Portal.app around this script and the Python running it: quick, for this Mac only. For an app to
+    share (Python bundled, signed, notarized, with the native engine's loader) use scripts/build-app.sh."""
+    if FROZEN:
+        sys.exit("this is already the packaged app")
     app = Path(dest) / "Windows Portal.app"
     shutil.rmtree(app, ignore_errors=True)
     (app / "Contents/MacOS").mkdir(parents=True)
@@ -2282,8 +2297,8 @@ def gui():
                     return messagebox.showinfo("Native engine", why[0].upper() + why[1:] + ".", parent=top)
                 if messagebox.askyesno("Native engine (preview)", "Wine built for Apple Silicon: Windows programs run "
                                        "through FEX instead of Rosetta. Graphics are vkd3d-proton and DXVK only (no D3DMetal "
-                                       "or DXMT), so many games run slower than on wine10 for now. It uses Highball's signed "
-                                       "loader, and bottles can't move to it: make a new one.\n\nDownload it (~415 MB)?", parent=top):
+                                       "or DXMT), so many games run slower than on wine10 for now. Bottles can't move to it: "
+                                       "make a new one.\n\nDownload it (~415 MB)?", parent=top):
                     bg("Downloading the native engine (~415 MB)…", get_engine, "arm64")
             tk.Button(bar, text="Get Native Engine…", width=16, command=guarded(get_native)).pack(pady=2)
         for label, fn in [("New Bottle…", do_new),

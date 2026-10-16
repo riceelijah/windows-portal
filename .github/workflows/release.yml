@@ -1,0 +1,59 @@
+# Builds a signed, notarized Windows Portal.app and DMG on demand. Needs these repository secrets (docs/signing.md):
+#   DEVELOPER_ID_P12          base64 of the Developer ID Application certificate + key, exported as .p12
+#   DEVELOPER_ID_P12_PASSWORD its export password
+#   SIGN_IDENTITY             "Developer ID Application: Your Name (TEAMID)"
+#   TEAM_ID                   the 10-character team id
+#   LOADER_PROFILE            base64 of the helper's Developer ID .provisionprofile
+#   NOTARY_APPLE_ID, NOTARY_PASSWORD   Apple ID and app-specific password for notarytool
+# and these repository variables: BUNDLE_ID, LOADER_BUNDLE_ID.
+name: Release app
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version
+        required: true
+        default: "1.0"
+jobs:
+  build:
+    runs-on: macos-26  # Apple Silicon with Xcode 26.4+, which the loader's link flags need
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # python.org's build, with Tk
+      - name: Signing keychain
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          PROFILE: ${{ secrets.LOADER_PROFILE }}
+          APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          KC=$RUNNER_TEMP/signing.keychain-db; KCPW=$(uuidgen)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          echo "$P12" | base64 --decode > $RUNNER_TEMP/id.p12
+          security import $RUNNER_TEMP/id.p12 -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KCPW" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          mkdir -p signing && echo "$PROFILE" | base64 --decode > signing/WineLoader.provisionprofile
+          xcrun notarytool store-credentials windows-portal --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --keychain "$KC"
+      - name: Build, sign, notarize
+        env:
+          WP_VERSION: ${{ inputs.version }}
+          WP_BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+          WP_LOADER_BUNDLE_ID: ${{ vars.LOADER_BUNDLE_ID }}
+          WP_SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+          WP_TEAM_ID: ${{ secrets.TEAM_ID }}
+          WP_LOADER_PROFILE: signing/WineLoader.provisionprofile
+          WP_NOTARY_PROFILE: windows-portal
+          WP_DMG: "1"
+        run: scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows-Portal-${{ inputs.version }}
+          path: dist/Windows Portal.dmg
