@@ -884,19 +884,20 @@ def _sync_steam():
     into the GPTK bottle (APFS copy-on-write via cp -c: instant, no extra disk until Steam updates the original);
     the rest stay in Steam's bottle and launch through Steam, so they get their launch options and DRM."""
     sources = [b for b in bottles() if b != STEAM_BOTTLE and (bottle(b) / "drive_c/Program Files (x86)/Steam/steamapps").is_dir()]
-    found = {g[0]: (b, *g[1:]) for b in sources for g in steam_games(b)}
+    # keyed by bottle and app id: the same game can be installed in two bottles' Steams (e.g. Wine 11 and native)
+    found = {f"{b}:{g[0]}": (b, *g) for b in sources for g in steam_games(b)}
     f = DATA / "steam_sync.json"
     synced = json.loads(f.read_text()) if f.exists() else {}
     # entries without "bottle" predate DX12-only cloning: redo them
-    changed = {a: g for a, g in found.items() if synced.get(a, {}).get("stamp") != g[3] or "bottle" not in synced[a]}
-    gone = [a for a in synced if a not in found]
+    changed = {k: g for k, g in found.items() if synced.get(k, {}).get("stamp") != g[4] or "bottle" not in synced[k]}
+    gone = [k for k in synced if k not in found]  # also old entries keyed by app id alone: redone below
     if not changed and not gone:
         return {}
-    for appid in gone:  # uninstalled in Steam
-        unplace_steam_game(synced.pop(appid))
-    for appid, (src, title, folder, stamp) in changed.items():  # new or updated in Steam
-        if appid in synced:
-            unplace_steam_game(synced[appid])
+    for key in gone:  # uninstalled in Steam
+        unplace_steam_game(synced.pop(key))
+    for key, (src, appid, title, folder, stamp) in changed.items():  # new or updated in Steam
+        if key in synced:
+            unplace_steam_game(synced[key])
         # D3DMetal is GPTK's: DirectX 12 needs it, and Highball's database names it best for some DX11 games too.
         # A wine10 bottle has D3DMetal itself, so its games stay with its Steam.
         if engine(src) not in ("wine10", "arm64") and (uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal"):
@@ -919,9 +920,9 @@ def _sync_steam():
         if exe:
             add_program(where, str(exe), title)
             mac_app(where, str(exe), title)
-        synced[appid] = {"title": title, "dir": folder.name, "stamp": stamp, "bottle": where}
+        synced[key] = {"title": title, "dir": folder.name, "stamp": stamp, "bottle": where}
     f.write_text(json.dumps(synced, indent=1))
-    return {"added or updated": [f"{found[a][1]} ({synced[a]['bottle']})" for a in changed], "removed": gone}
+    return {"added or updated": [f"{found[k][2]} ({synced[k]['bottle']})" for k in changed], "removed": gone}
 
 
 # Highball's open compatibility database (github.com/gauthierpiarrette/highball-db): per-game verdicts for Wine on
@@ -1009,7 +1010,7 @@ def steam_appid_of(name, title):
     """Steam app id of a library entry steam_sync placed, else None."""
     f = DATA / "steam_sync.json"
     synced = json.loads(f.read_text()) if f.exists() else {}
-    return next((a for a, e in synced.items() if e["title"] == title and e.get("bottle", STEAM_BOTTLE) == name), None)
+    return next((k.split(":")[-1] for k, e in synced.items() if e["title"] == title and e.get("bottle", STEAM_BOTTLE) == name), None)
 
 # ---------- game stores: everything you own on Steam, Epic, GOG and itch.io, installed or not ----------
 STORES = {"steam": "Steam", "epic": "Epic Games", "gog": "GOG", "itch": "itch.io", "amazon": "Amazon Games"}
@@ -2012,7 +2013,12 @@ def gui():
     query.trace_add("write", search_changed)
 
     # ---------- library ----------
-    def refresh():
+    def refresh(store=None):
+        """Re-reads bottles and the library (running Steam sync, so new Steam installs appear); store refetches that
+        store's list too."""
+        if store:
+            state["store_fetched"].discard(store)
+        state["last_refresh"] = time.time()
         draw_nav()
         if state["manager"]:
             state["manager"]()
@@ -2284,7 +2290,7 @@ def gui():
                      bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
             button(bar, "Disconnect", lambda: messagebox.askyesno("Windows Portal", f"Disconnect {STORES[store]}?")
                    and (store_logout(store), state["stores"].pop(store, None), draw())).pack(side="left", padx=4)
-        button(bar, "Refresh", lambda: (state["store_fetched"].discard(store), draw())).pack(side="left", padx=4)
+        button(bar, "Refresh", lambda: refresh(store)).pack(side="left", padx=4)
         if store != "steam":
             button(bar, "Cover Art…", set_art_key).pack(side="left", padx=4)
 
@@ -2586,6 +2592,10 @@ def gui():
                           ("Install Software…", do_install, True)]:
         button(acts, text, fn, acc).pack(side="bottom", fill="x", pady=3)
 
+    def activated(e):  # coming back to the window (e.g. after installing in Steam) shows what changed
+        if e.widget is root and time.time() - state.get("last_refresh", 0) > 15 and not status.get():
+            refresh(store_view())
+    root.bind("<Activate>", activated)
     refresh()
     poll()
     root.mainloop()
