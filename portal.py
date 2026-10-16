@@ -5,8 +5,12 @@
   python3 portal.py setup                  # install Wine (Game Porting Toolkit) + winetricks
   python3 portal.py package [DIR]          # build "Windows Portal.app" (default ~/Applications)
   python3 portal.py new NAME [WINVER] [ENGINE]  # WINVER: win10 (default), win11, win7, winxp64...
-                                           # ENGINE: wine (Wine 11, default) or gptk (DirectX 12 games)
+                                           # ENGINE: wine10 (default once installed), wine (Wine 11) or gptk
   python3 portal.py engine NAME [ENGINE]   # show or switch a bottle's engine
+  python3 portal.py get-engine wine10      # Wine 10 with DXMT, D3DMetal and DXVK (~250 MB)
+  python3 portal.py graphics NAME [LAYER]  # show or set a bottle's graphics layer: dxmt, d3dmetal, dxvk, wined3d
+  python3 portal.py accept-d3dmetal        # read and accept Apple's license, needed for d3dmetal on wine10
+  python3 portal.py sync NAME [MODE]       # wine10 bottles: msync (fastest, default), esync or none (Steam's window)
   python3 portal.py winver NAME [WINVER]   # show or change the Windows version (restart its programs after)
   python3 portal.py keys NAME [on|off]     # Command as Ctrl, Option as Alt (Mac copy/paste); on for new bottles
   python3 portal.py compat GAME            # will it run? Steam app id or title, from Highball's open database
@@ -23,6 +27,11 @@
   python3 portal.py tricks NAME [verbs]    # winetricks (e.g. vcrun2022 corefonts)
   python3 portal.py kill NAME              # force quit everything in a bottle
   python3 portal.py export NAME DEST       # writes DEST.tar.gz
+  python3 portal.py store login STORE [CODE]     # epic, gog or itch; without CODE, opens the sign-in page
+  python3 portal.py store logout STORE
+  python3 portal.py store list STORE             # steam, epic, gog or itch: everything you own, installed or not
+  python3 portal.py store install STORE ID NAME  # install a game you own into bottle NAME
+  python3 portal.py store play STORE ID
   python3 portal.py import ARCHIVE
   python3 portal.py delete NAME
 
@@ -30,7 +39,8 @@ Every bottle is 64-bit and runs 32-bit programs too (WoW64); this Wine can't mak
 Add your own installers to ~/Library/Application Support/WindowsPortal/catalog.json:
   {"My App": {"url": "https://.../setup.exe", "file": "myapp-setup.exe", "tricks": ["vcrun2022"]}}
 """
-import base64, json, os, platform, re, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile, urllib.error, urllib.request
+import base64, hashlib, json, os, platform, re, struct, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile
+import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 DATA = Path.home() / "Library/Application Support/WindowsPortal"
@@ -40,11 +50,34 @@ APPS = Path.home() / "Applications/Windows Portal"
 WINE_VERSION = "11.18"  # Gcenx/macOS_Wine_builds, the official WineHQ macOS packages
 WINE_URL = f"https://github.com/Gcenx/macOS_Wine_builds/releases/download/{WINE_VERSION}/wine-devel-{WINE_VERSION}-osx64.tar.xz"
 WINE_SHA256 = "aa0ea4c82e636ae7bca2076387cb0a5affa26509ad13f119ecd0d62bd7ba6f82"
-ENGINES = {  # per bottle; GPTK is the one with D3DMetal, so DirectX 12 games go there
+# Sikarugir's Wine 10 (built from the CrossOver tree's Mac work) plus its runtime: MoltenVK, GStreamer and the graphics
+# layers (DXMT, D3DMetal, DXVK). Plain WineHQ builds lack the Mac driver hooks DXMT and D3DMetal need, and msync.
+SIK = DATA / "engines/sikarugir-10.0_6"
+ENGINES = {  # per bottle
+    "wine10": SIK / "wswine.bundle/bin/wine",
     "wine": DATA / f"engines/wine-{WINE_VERSION}/Wine Devel.app/Contents/Resources/wine/bin/wine",
     "gptk": Path("/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"),
 }
-ENGINE_NAMES = {"wine": f"Wine {WINE_VERSION}", "gptk": "Game Porting Toolkit (DirectX 12)"}
+ENGINE_NAMES = {"wine10": "Wine 10 (DXMT, D3DMetal, DXVK)", "wine": f"Wine {WINE_VERSION}", "gptk": "Game Porting Toolkit (DirectX 12)"}
+ENGINE_AGE = {"gptk": 0, "wine10": 1, "wine": 2}  # Wine upgrades a prefix it opens; an older Wine can't open it after
+GRAPHICS = {  # layers each engine can use, default first
+    "wine10": ["dxmt", "d3dmetal", "dxvk", "wined3d"],
+    "wine": ["wined3d", "dxvk"],  # DXVK here is experimental: these DXVK builds were made for CrossOver-tree Wine
+    "gptk": ["d3dmetal"],
+}
+PINNED = {  # download: (url, sha256). Pinned, so a changed file is refused rather than run.
+    "wine": (WINE_URL, WINE_SHA256),
+    "wine10": ("https://github.com/Sikarugir-App/Engines/releases/download/v1.0/WS12WineSikarugir10.0_6.tar.xz",
+               "9da7ee0cbf386522f3a9906943726d9c3c125dbbd9ab120e3cde80e88d6091b2"),
+    "wine10-runtime": ("https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.11.tar.xz",
+                       "9fa15479e7ff6abd99c1d07be285fb95f41fc6991586502427152b1f7d6ccb8a"),
+    "dxvk": ("https://github.com/Gcenx/DXVK-macOS/releases/download/v1.10.3-20230507-repack/dxvk-macOS-async-v1.10.3-20230507-repack.tar.gz",
+             "acd1520ad105d8ef124a09c8e11a259a5dc8bdc565ad18e0e52693f9807b2477"),
+    "legendary": ("https://github.com/legendary-gl/legendary/releases/download/0.21.0/legendary_macOS_arm64",
+                  "28f5f7d0eb8c029679d4faaa483ec85888af17a9a75977ae9170c21d8ce3428b"),
+}
+D3DMETAL_LICENSE = ("D3DMetal is Apple's, from the Game Porting Toolkit. Apple's license allows non-commercial use only, "
+                    "to develop, test or evaluate games on Apple hardware, and forbids modifying or redistributing it.")
 
 CATALOG = {
     "Steam": {"url": "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe", "file": "SteamSetup.exe", "engine": "wine"},
@@ -61,20 +94,79 @@ CATALOG = {
 }
 
 
+def cfg(name):
+    f = bottle(name) / "portal.json"
+    return json.loads(f.read_text()) if f.exists() else {"engine": "gptk"}  # pre-engine bottles were GPTK
+
+
+def set_cfg(name, **values):
+    (bottle(name) / "portal.json").write_text(json.dumps({**cfg(name), **values}))
+
+
 def engine(name):
-    cfg = bottle(name) / "portal.json"
-    return json.loads(cfg.read_text())["engine"] if cfg.exists() else "gptk"  # pre-engine bottles were GPTK
+    return cfg(name)["engine"]
 
 
 def set_engine(name, eng):
     if eng not in ENGINES:
         sys.exit(f"unknown engine {eng!r}; choose from: {', '.join(ENGINES)}")
     if (bottle(name) / "portal.json").exists():
-        if engine(name) == "wine" and eng == "gptk" and (bottle(name) / "system.reg").exists():
-            sys.exit(f"{name} has been upgraded by Wine {WINE_VERSION}; GPTK's older Wine can't open it reliably. "
-                     "Make a new bottle with the gptk engine instead.")
+        old = engine(name)
+        if ENGINE_AGE[eng] < ENGINE_AGE[old] and (bottle(name) / "system.reg").exists():
+            sys.exit(f"{name} has been upgraded by {ENGINE_NAMES[old]}; the older Wine in {ENGINE_NAMES[eng]} can't open it "
+                     f"reliably. Make a new bottle with the {eng} engine instead.")
         kill(name)  # stop the old engine's wineserver before the other one touches the bottle
-    (bottle(name) / "portal.json").write_text(json.dumps({"engine": eng}))
+    set_cfg(name, engine=eng)
+    if eng == "wine10" and "sync" not in cfg(name) and steam_exe(name, "steam.exe"):
+        set_cfg(name, sync="none")  # Steam's window hangs under msync/esync on this Wine
+    if graphics(name) == "dxvk" and eng == "wine":
+        install_dxvk(name)
+
+
+def graphics(name):
+    """The bottle's graphics layer: its setting if this engine has it, else the engine's default."""
+    choices = GRAPHICS[engine(name)]
+    return cfg(name).get("graphics") if cfg(name).get("graphics") in choices else choices[0]
+
+
+def set_graphics(name, layer):
+    eng = engine(name)
+    if layer not in GRAPHICS[eng]:
+        sys.exit(f"{ENGINE_NAMES[eng]} can use: {', '.join(GRAPHICS[eng])}"
+                 + ("; DXMT and DXVK need the wine10 engine (python3 portal.py engine NAME wine10)" if eng == "gptk" else ""))
+    if layer == "d3dmetal" and eng == "wine10" and not d3dmetal_accepted():
+        sys.exit("D3DMetal needs Apple's license accepted first: python3 portal.py accept-d3dmetal")
+    if layer == "dxvk" and eng == "wine":
+        install_dxvk(name)
+    set_cfg(name, graphics=layer)
+    return layer  # takes effect for programs started after this
+
+
+def d3dmetal_accepted():
+    f = DATA / "licenses.json"
+    return f.exists() and json.loads(f.read_text()).get("d3dmetal")
+
+
+def accept_d3dmetal(ask=True):
+    if ask:
+        print(D3DMETAL_LICENSE, f"\nFull text: {SIK / 'Frameworks/renderer/d3dmetal/License.rtf'}")
+        if input("Type yes to accept: ").strip().lower() != "yes":
+            sys.exit("not accepted")
+    DATA.mkdir(parents=True, exist_ok=True)
+    (DATA / "licenses.json").write_text(json.dumps({"d3dmetal": time.strftime("%Y-%m-%d")}))
+
+
+def sync_mode(name, mode=None):
+    """wine10 only. msync is fastest for games, but Steam's own window hangs under msync/esync on this Wine
+    (Highball's Steam recipe), so bottles that run Steam's window use none. Restart the bottle's programs after."""
+    if engine(name) != "wine10":
+        sys.exit("sync modes apply to wine10 bottles")
+    if mode:
+        if mode not in ("msync", "esync", "none"):
+            sys.exit("sync: use msync, esync or none")
+        kill(name)  # the wineserver fixes the mode when it starts
+        set_cfg(name, sync=mode)
+    return cfg(name).get("sync", "msync")
 
 
 def wine(name):
@@ -95,11 +187,87 @@ def bottle(name, exists=True):
 def wine_env(name):
     # Speed/memory: no debug logging, esync/msync instead of wineserver round-trips for every lock,
     # no winemenubuilder (it spawns per install and litters ~/.local), AVX advertised to Rosetta for games.
+    extra, overrides = engine_env(name)
     return {"WINEPREFIX": str(bottle(name)), "WINEDEBUG": "-all", "WINEESYNC": "1", "WINEMSYNC": "1",
             # gameoverlayrenderer: Steam's in-game overlay hangs games under Wine (Portal spun at 100% CPU, no window).
             # Steam passes its environment to the games it launches, so this covers them too.
-            "WINEDLLOVERRIDES": os.environ.get("WINEDLLOVERRIDES", "winemenubuilder.exe=d;gameoverlayrenderer=d"),
-            "ROSETTA_ADVERTISE_AVX": "1"}
+            "WINEDLLOVERRIDES": ";".join([os.environ.get("WINEDLLOVERRIDES", "winemenubuilder.exe=d;gameoverlayrenderer=d"),
+                                          *overrides]),
+            "ROSETTA_ADVERTISE_AVX": "1", **extra}
+
+
+def engine_env(name):
+    """({env}, [DLL overrides]) for the bottle's engine and graphics layer."""
+    eng, layer, env, overrides = engine(name), graphics(name), {}, []
+    if eng == "wine10":
+        fw = SIK / "Frameworks"
+        gst = fw / "GStreamer.framework/Versions/1.0/lib"
+        env = {"DYLD_FALLBACK_LIBRARY_PATH": f"{fw}:{gst}", "DYLD_FALLBACK_FRAMEWORK_PATH": str(fw),
+               "GST_PLUGIN_PATH": f"{gst}/gstreamer-1.0",
+               "CX_FWD_COMPAT_GL_CTX": "1"}  # GL 3.2+ core contexts without the forward-compatible bit work too
+        mode = cfg(name).get("sync", "msync")
+        env.update(WINEMSYNC="1" if mode == "msync" else "0", WINEESYNC="1" if mode == "esync" else "0")
+        # Layers are folders of DLLs this Wine searches before its own. d9vk (DXVK's Direct3D 9) rides along with the
+        # Metal layers, which have no Direct3D 9 of their own; 64-bit-only D3DMetal falls back to DXMT for 32-bit games.
+        layers = {"dxmt": ["dxmt", "d9vk"], "d3dmetal": ["d3dmetal", "dxmt", "d9vk"], "dxvk": ["d9vk", "dxvk"]}.get(layer, [])
+        if layers:
+            env["WINEDLLPATH_PREPEND"] = ":".join(str(fw / "renderer" / l / "wine") for l in layers)
+        if layer == "d3dmetal":
+            ext = fw / "renderer/d3dmetal/external"
+            env.update(CX_D3DMETALPATH=str(ext), DYLD_FALLBACK_LIBRARY_PATH=f"{env['DYLD_FALLBACK_LIBRARY_PATH']}:{ext}",
+                       DYLD_FALLBACK_FRAMEWORK_PATH=f"{fw}:{ext}")
+        if layer == "dxvk":
+            overrides.append("dxgi,d3d9,d3d10core,d3d11=n,b")
+    elif eng == "wine":  # DXVK's DLLs sit in the bottle; this picks them or Wine's own per launch
+        overrides.append("d3d10core,d3d11=n,b" if layer == "dxvk" else "d3d10core,d3d11=b")
+    return env, overrides
+
+
+def fetch(what):
+    """Downloads a PINNED file and checks its SHA-256."""
+    url, sha = PINNED[what]
+    f = download(url, Path(urllib.parse.urlparse(url).path).name)
+    h = hashlib.sha256()
+    with open(f, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    if h.hexdigest() != sha:
+        f.unlink()
+        sys.exit(f"{Path(f).name} failed its checksum; deleted it, try again")
+    return f
+
+
+def get_engine(eng="wine10"):
+    """Installs the wine10 engine: Sikarugir's Wine 10 and its runtime (MoltenVK, GStreamer, graphics layers)."""
+    if eng != "wine10":
+        sys.exit("get-engine installs wine10; the others come with: python3 portal.py setup")
+    if ENGINES["wine10"].exists():
+        return
+    tmp = SIK.with_name(SIK.name + ".part")  # renamed when complete, so a half-unpacked engine never looks installed
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "Frameworks").mkdir(parents=True)
+    for part, dest, only in (("wine10", tmp, []),
+                             ("wine10-runtime", tmp / "Frameworks", ["--strip-components", "3", "Template-1.0.11.app/Contents/Frameworks"])):
+        f = fetch(part)
+        subprocess.run(["tar", "-xf", str(f), "-C", str(dest), *only], check=True)
+        f.unlink()
+    tmp.rename(SIK)
+
+
+def install_dxvk(name):
+    """Puts DXVK-macOS's DLLs in a Wine 11 bottle; engine_env decides per launch whether they're used."""
+    src = DATA / "engines/dxvk-macos-1.10.3"
+    if not src.exists():
+        f = fetch("dxvk")
+        tmp = src.with_name(src.name + ".part")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        subprocess.run(["tar", "-xf", str(f), "-C", str(tmp), "--strip-components", "1"], check=True)
+        f.unlink()
+        tmp.rename(src)
+    for arch, sysdir in (("x64", "system32"), ("x32", "syswow64")):
+        for dll in (src / arch).glob("*.dll"):
+            shutil.copy(dll, bottle(name) / "drive_c/windows" / sysdir / dll.name)
 
 
 def env(name):
@@ -116,19 +284,12 @@ def setup():
     subprocess.run(["brew", "install", "--cask", "game-porting-toolkit"], check=True)
     subprocess.run(["brew", "install", "winetricks"], check=True)
     if not ENGINES["wine"].exists():
-        import hashlib
-        tarball = download(WINE_URL, f"wine-devel-{WINE_VERSION}.tar.xz")
-        h = hashlib.sha256()
-        with open(tarball, "rb") as f:
-            while chunk := f.read(1 << 20):
-                h.update(chunk)
-        if h.hexdigest() != WINE_SHA256:
-            tarball.unlink()
-            sys.exit("Wine download failed its checksum; deleted it, run setup again")
+        tarball = fetch("wine")
         dest = DATA / f"engines/wine-{WINE_VERSION}"
         dest.mkdir(parents=True, exist_ok=True)
         subprocess.run(["tar", "-xf", str(tarball), "-C", str(dest)], check=True)
         tarball.unlink()
+    get_engine("wine10")
 
 
 def bottles():
@@ -137,7 +298,7 @@ def bottles():
 
 def new(name, winver="win10", eng=None):
     p = bottle(name, exists=False)
-    eng = eng or ("wine" if ENGINES["wine"].exists() else "gptk")
+    eng = eng or next((e for e in ("wine10", "wine") if ENGINES[e].exists()), "gptk")
     if p.exists():
         sys.exit(f"bottle {name} already exists")
     if not ENGINES.get(eng, Path("/nonexistent")).exists():
@@ -220,6 +381,9 @@ def steam_appid(name, target):
 
 
 def run(name, exe, *args, wait=True):
+    if app := epic_app_of(name, exe):  # Epic games need a fresh login token on their command line
+        proc = epic_launch(name, app, *args)
+        return proc.wait() if wait else proc
     w = wine(name)
     if appid := steam_appid(name, exe):  # Steam games launch through Steam: it adds their launch options and DRM
         exe, args = "steam.exe", ("-applaunch", appid, *args)
@@ -319,6 +483,9 @@ def install(name, item):
         tricks(name, "-q", *e["tricks"])
     if e.get("url"):
         run(name, str(download(e["url"], e.get("file") or "setup.exe")), *e.get("args", []))
+    if item == "Steam" and engine(name) == "wine10" and "sync" not in cfg(name):
+        sync_mode(name, "none")  # Steam's window hangs under msync/esync on this Wine
+        print(f"{name}: sync set to none for Steam's window; python3 portal.py sync {name} msync trades that for game speed")
     if item == "Steam" and steam_exe(name, "steam.exe"):  # its installer starts Steam without the black-window fix
         kill(name)
         run(name, "steam.exe", wait=False)
@@ -349,7 +516,7 @@ def register_new(name, before, fallback=None, title=None):
     return added
 
 
-def install_file(name, path):
+def install_file(name, path, title=None):
     """Runs an installer, or unpacks an archive into C:\\Games and installs/registers what's inside."""
     bottle(name)
     before, low = programs(name), path.lower()
@@ -357,7 +524,7 @@ def install_file(name, path):
         run(name, path)
         # ponytail: an exe that makes no shortcut is assumed portable; an installer that silently
         # skips shortcuts lands in the library as its setup.exe, Remove + Add Program fixes it.
-        return register_new(name, before, fallback=None if low.endswith(".msi") else path)
+        return register_new(name, before, fallback=None if low.endswith(".msi") else path, title=title)
     if not low.endswith(ARCHIVES):
         sys.exit(f"don't know how to install {Path(path).name}; use an .exe, .msi or archive")
     stem = Path(path).name
@@ -378,7 +545,7 @@ def install_file(name, path):
     main = main_exe(dest)
     if not main:
         sys.exit(f"no program found in {Path(path).name}; files are in {dest}")
-    return register_new(name, before, fallback=str(main), title=stem)
+    return register_new(name, before, fallback=str(main), title=title or stem)
 
 
 STEAM_BOTTLE = "steam-gptk"  # GPTK bottle that Steam games get cloned into, for DirectX 12 / D3DMetal
@@ -463,7 +630,8 @@ def _sync_steam():
         if appid in synced:
             unplace_steam_game(synced[appid])
         # D3DMetal is GPTK's: DirectX 12 needs it, and Highball's database names it best for some DX11 games too.
-        if uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal":
+        # A wine10 bottle has D3DMetal itself, so its games stay with its Steam.
+        if engine(src) != "wine10" and (uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal"):
             if not (HOME / STEAM_BOTTLE).exists():
                 if not ENGINES["gptk"].exists():
                     sys.exit("DirectX 12 games need Game Porting Toolkit; run: python3 portal.py setup")
@@ -574,6 +742,383 @@ def steam_appid_of(name, title):
     synced = json.loads(f.read_text()) if f.exists() else {}
     return next((a for a, e in synced.items() if e["title"] == title and e.get("bottle", STEAM_BOTTLE) == name), None)
 
+# ---------- game stores: everything you own on Steam, Epic, GOG and itch.io, installed or not ----------
+STORES = {"steam": "Steam", "epic": "Epic Games", "gog": "GOG", "itch": "itch.io"}
+STORE_DIR = DATA / "stores"  # tokens and cached library lists; readable by this user only
+LEGENDARY_HOME = DATA / "legendary"
+# GOG Galaxy's own public client credentials, which every third-party GOG client (Heroic, lgogdownloader, minigalaxy) uses.
+GOG_CLIENT = ("46899977096215655", "9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9")
+GOG_REDIRECT = "https://embed.gog.com/on_login_success?origin=client"
+STORE_LOGIN = {
+    "epic": ("https://legendary.gl/epiclogin", "Sign in to Epic, then copy the authorizationCode value shown (without quotes)."),
+    "gog": ("https://auth.gog.com/auth?" + urllib.parse.urlencode({"client_id": GOG_CLIENT[0], "redirect_uri": GOG_REDIRECT,
+                                                                   "response_type": "code", "layout": "client2"}),
+            "Sign in to GOG. You land on a blank page: copy its whole address."),
+    "itch": ("https://itch.io/user/settings/api-keys", "Click \"Generate new API key\" and copy the key."),
+}
+
+
+def store_file(file, data=None):
+    f = STORE_DIR / file
+    if data is None:
+        return json.loads(f.read_text()) if f.exists() else {}
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    f.touch(0o600)
+    f.write_text(json.dumps(data, indent=1))
+    return data
+
+
+def http_json(url, headers=None, data=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "WindowsPortal", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def fetch_authed(url, auth, folder, name=None):
+    """Downloads url to folder (the file's own name unless given), sending auth only to url itself, never the CDN
+    it redirects to. Kept in the cache, so a repeated install doesn't download again."""
+    req = urllib.request.Request(url, headers={"User-Agent": "WindowsPortal"})
+    for k, v in auth.items():
+        req.add_unredirected_header(k, v)
+    with urllib.request.urlopen(req) as r:
+        dest = Path(folder) / (name or urllib.parse.unquote(Path(urllib.parse.urlparse(r.url).path).name))
+        size = int(r.headers.get("Content-Length") or -1)
+        if not (dest.exists() and dest.stat().st_size == size):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest.with_suffix(dest.suffix + ".part"), "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+            dest.with_suffix(dest.suffix + ".part").rename(dest)
+    return dest
+
+
+def store_connected(store):
+    return {"steam": lambda: True, "epic": lambda: (LEGENDARY_HOME / "user.json").exists(),
+            "gog": lambda: bool(store_file("gog.json")), "itch": lambda: bool(store_file("itch.json"))}[store]()
+
+
+def store_login(store, code=None):
+    """Connects an account. Without code, opens the sign-in page and says what to paste back."""
+    if store not in STORE_LOGIN:
+        sys.exit("store login: epic, gog or itch (Steam needs no login here: sign in to Steam in a bottle)")
+    if not code:
+        subprocess.run(["open", STORE_LOGIN[store][0]])
+        return f"{STORE_LOGIN[store][1]}\nThen run: python3 portal.py store login {store} PASTED"
+    code = code.strip().strip('"')
+    if store == "epic":
+        legendary("auth", "--disable-webview", "--code", code)
+    elif store == "gog":
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(code).query).get("code", [code])[0]  # the address or the code
+        gog_token(grant_type="authorization_code", code=code, redirect_uri=GOG_REDIRECT)
+    else:
+        try:
+            http_json("https://api.itch.io/profile", {"Authorization": f"Bearer {code}"})
+        except urllib.error.HTTPError:
+            sys.exit("itch.io didn't accept that API key")
+        store_file("itch.json", {"key": code})
+    store_list(store)
+    return f"connected {STORES[store]}"
+
+
+def store_logout(store):
+    if store == "epic" and store_connected("epic"):
+        legendary("auth", "--delete")
+    for f in (f"{store}.json", f"{store}-library.json"):
+        (STORE_DIR / f).unlink(missing_ok=True)
+
+
+def store_list(store, refresh=True):
+    """{id: {"title", "installed": bottle or None, ...}} of everything the account owns; cached for offline use."""
+    if store == "steam":  # read from disk, so always fresh
+        games = {}
+        for b in bottles():
+            installed = {a for a, *_ in steam_games(b)} if (steam_root(b) / "steamapps").is_dir() else set()
+            for appid, title in steam_owned(b).items():
+                if appid not in games or appid in installed:  # owned in several bottles: the one it's installed in
+                    games[appid] = {"title": title, "bottle": b, "installed": b if appid in installed else None}
+        return games
+    if not refresh or not store_connected(store):
+        return store_file(f"{store}-library.json")
+    games = {"epic": epic_list, "gog": gog_list, "itch": itch_list}[store]()
+    records = store_file("installed.json")
+    for gid, g in games.items():
+        r = records.get(f"{store}:{gid}")
+        g.setdefault("installed", r["bottle"] if r and (HOME / r["bottle"]).is_dir() else None)
+    return store_file(f"{store}-library.json", games)
+
+
+def store_install(store, gid, name):
+    bottle(name)
+    gid = str(gid)
+    if store == "steam":  # Steam itself downloads it, in its window
+        if not (steam := steam_exe(name, "steam.exe")):
+            sys.exit(f"Steam isn't installed in {name}")
+        return run(name, str(steam), f"steam://install/{gid}", wait=False)
+    before = programs(name)
+    title = (store_list(store, refresh=False).get(gid) or {}).get("title")
+    path = {"epic": epic_install, "gog": gog_install, "itch": itch_install}[store](name, gid)
+    added = register_new(name, before) if store == "epic" else install_file(name, str(path), title)
+    target = next(iter(added.values()), None)
+    store_file("installed.json", {**store_file("installed.json"),
+                                  f"{store}:{gid}": {"bottle": name, "title": title, "target": target}})
+    games = store_list(store, refresh=False)
+    if gid in games:
+        games[gid]["installed"] = name
+        store_file(f"{store}-library.json", games)
+    return added
+
+
+def store_play(store, gid):
+    gid = str(gid)
+    g = store_list(store, refresh=False).get(gid) or {}
+    if store == "steam":
+        if not g.get("installed"):
+            sys.exit("not installed; install it first")
+        return run(g["installed"], str(steam_exe(g["installed"], "steam.exe")), "-applaunch", gid, wait=False)
+    r = store_file("installed.json").get(f"{store}:{gid}") or sys.exit("not installed by Windows Portal; install it first")
+    if store == "epic":
+        return epic_launch(r["bottle"], gid)
+    if not r.get("target"):
+        sys.exit(f"don't know which program starts it; use Add Program in bottle {r['bottle']}")
+    return run(r["bottle"], r["target"], wait=False)
+
+
+# Steam: the library the Windows Steam client already keeps on disk after one sign-in. No password or API key.
+def steam_root(name):
+    return bottle(name) / "drive_c/Program Files (x86)/Steam"
+
+
+def steam_owned(name):
+    """{appid: title} of games the account signed in to a bottle's Steam owns: appcache/librarycache has a folder
+    (older clients: files) per owned app, and appinfo.vdf says which are games."""
+    cache = steam_root(name) / "appcache/librarycache"
+    ids = {int(m.group()) for p in cache.iterdir() if (m := re.match(r"\d+", p.name))} if cache.is_dir() else set()
+    info = steam_appinfo(steam_root(name) / "appcache/appinfo.vdf", ids) if ids else {}
+    return {str(a): t for a, (t, kind) in sorted(info.items(), key=lambda i: str(i[1][0]).lower()) if kind == "game" and t}
+
+
+def steam_appinfo(path, wanted):
+    """{appid: (name, type)} from Steam's binary appinfo.vdf (formats 28 and 29), for the appids in wanted."""
+    try:
+        b = Path(path).read_bytes()
+    except OSError:
+        return {}
+    if len(b) < 16 or struct.unpack_from("<I", b, 0)[0] not in (0x07564428, 0x07564429):
+        return {}
+    try:
+        return _appinfo(b, wanted)
+    except (ValueError, IndexError, struct.error):
+        return {}  # mid-write or a format Steam hasn't told anyone about: no library rather than a crash
+
+
+def _appinfo(b, wanted):
+    magic, = struct.unpack_from("<I", b, 0)
+    strings, off = None, 8
+    if magic == 0x07564429:  # keys are indexes into a string table at the end of the file
+        table, = struct.unpack_from("<q", b, off)
+        off += 8
+        count, = struct.unpack_from("<I", b, table)
+        strings, p = [], table + 4
+        for _ in range(count):
+            end = b.index(b"\0", p)
+            strings.append(b[p:end].decode("utf-8", "replace"))
+            p = end + 1
+
+    def cstr(o):
+        end = b.index(b"\0", o)
+        return b[o:end].decode("utf-8", "replace"), end + 1
+
+    def obj(o):  # binary KeyValues: type byte, key, value; 0x08 closes the object
+        out = {}
+        while (t := b[o]) != 8:
+            o += 1
+            if strings is None:
+                key, o = cstr(o)
+            else:
+                key, o = strings[struct.unpack_from("<I", b, o)[0]], o + 4
+            if t == 0:
+                out[key.lower()], o = obj(o)
+            elif t == 1:
+                out[key.lower()], o = cstr(o)
+            elif t in (2, 3, 4, 6):
+                out[key.lower()], o = struct.unpack_from("<i", b, o)[0], o + 4
+            elif t in (7, 10):
+                out[key.lower()], o = struct.unpack_from("<q", b, o)[0], o + 8
+            else:
+                raise ValueError(f"value type {t}")
+        return out, o + 1
+
+    apps = {}
+    while (appid := struct.unpack_from("<I", b, off)[0]):
+        size, = struct.unpack_from("<I", b, off + 4)
+        start, off = off + 8, off + 8 + size
+        if appid in wanted:
+            try:  # skip state, update time, token, hashes and change number (60 bytes) to the KeyValues
+                root, _ = obj(start + 60)
+                common = root.get("appinfo", root).get("common", {})
+                apps[appid] = (common.get("name"), str(common.get("type", "")).lower())
+            except (ValueError, IndexError, struct.error, AttributeError):
+                pass  # one odd entry shouldn't hide the rest of the library
+    return apps
+
+
+# Epic: through Legendary (github.com/legendary-gl/legendary), which installs and launches Epic games without the Epic
+# launcher, whose installs fail under Wine. Your login stays in LEGENDARY_HOME.
+def legendary(*args, stream=False):
+    exe = DATA / "tools/legendary"
+    if not exe.exists():
+        if platform.machine() != "arm64":  # the pinned build is Apple Silicon only
+            exe = Path(shutil.which("legendary") or sys.exit("Epic needs Legendary on Intel Macs: pip3 install legendary-gl"))
+        else:
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(fetch("legendary"), exe)
+            exe.chmod(0o755)
+    e = {**os.environ, "LEGENDARY_CONFIG_PATH": str(LEGENDARY_HOME)}
+    if stream:  # installs: show progress
+        if rc := subprocess.run([str(exe), *args], env=e).returncode:
+            sys.exit(f"legendary {args[0]} failed ({rc})")
+        return ""
+    p = subprocess.run([str(exe), *args], env=e, capture_output=True, text=True)
+    if p.returncode:
+        sys.exit(f"legendary {args[0]} failed: {(p.stderr or p.stdout).strip().splitlines()[-1:] or p.returncode}")
+    return p.stdout
+
+
+def legendary_json(*args):
+    out = legendary(*args)
+    starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+    return json.loads(out[min(starts):]) if starts else None
+
+
+def epic_installed():
+    """{app_name: (install folder, executable)} for games Legendary installed whose folder still exists."""
+    return {g["app_name"]: (g["install_path"], g.get("executable", "")) for g in legendary_json("list-installed", "--json") or []
+            if g.get("install_path") and os.path.isdir(g["install_path"])}
+
+
+def epic_list():
+    where = {app: next((b for b in bottles() if str(Path(path).resolve()).startswith(f"{(HOME / b / 'drive_c').resolve()}/")), None)
+             for app, (path, _) in epic_installed().items()}
+    return {g["app_name"]: {"title": g.get("app_title") or g["app_name"], "installed": where.get(g["app_name"])}
+            for g in legendary_json("list", "--platform", "Windows", "--json") or []}
+
+
+def epic_install(name, app):
+    base = bottle(name) / "drive_c/Games"
+    base.mkdir(parents=True, exist_ok=True)
+    # -y answers the confirmations and --skip-sdl the optional-content prompt, which would otherwise wait on stdin
+    legendary("install", app, "--platform", "Windows", "--base-path", str(base), "-y", "--skip-sdl", stream=True)
+    path, exe = epic_installed().get(app) or sys.exit(f"Legendary didn't install {app}")
+    title = (store_list("epic", refresh=False).get(app) or {}).get("title") or app
+    target = str(Path(path) / exe.replace("\\", "/"))
+    store_file("installed.json", {**store_file("installed.json"), f"epic:{app}": {"bottle": name, "title": title, "target": target}})
+    add_program(name, target, title)
+    return None
+
+
+def epic_app_of(name, target):
+    """Legendary's app name if target is an Epic game Windows Portal installed in this bottle."""
+    if not (STORE_DIR / "installed.json").exists():
+        return None
+    return next((k[5:] for k, r in store_file("installed.json").items()
+                 if k.startswith("epic:") and r["bottle"] == name and r.get("target") == target), None)
+
+
+def epic_launch(name, app, *extra):
+    """Starts an Epic game with the one-time login token Legendary fetches; most Epic games refuse to start without it."""
+    info = legendary_json("launch", app, "--json", "--skip-version-check", "--no-wine")  # --no-wine: we run Wine ourselves
+    folder = Path(info["game_directory"])
+    exe = folder / info["game_executable"].replace("\\", "/")
+    args = [*info.get("egl_parameters", []), *info.get("game_parameters", []), *info.get("user_parameters", []), *extra]
+    return subprocess.Popen([wine(name), str(exe), *args], env={**env(name), **(info.get("environment") or {})},
+                            cwd=info.get("working_directory") or folder)
+
+
+# GOG: your library and its offline installers, through GOG's own web API.
+def gog_token(**params):
+    t = http_json("https://auth.gog.com/token?" + urllib.parse.urlencode(
+        {"client_id": GOG_CLIENT[0], "client_secret": GOG_CLIENT[1], **params}))
+    t["expires_at"] = time.time() + t.get("expires_in", 3600) - 60
+    return store_file("gog.json", t)
+
+
+def gog_auth():
+    t = store_file("gog.json") or sys.exit("connect GOG first: python3 portal.py store login gog")
+    if time.time() > t["expires_at"]:
+        t = gog_token(grant_type="refresh_token", refresh_token=t["refresh_token"])
+    return {"Authorization": f"Bearer {t['access_token']}"}
+
+
+def gog_list():
+    games, page, pages = {}, 1, 1
+    while page <= pages:
+        d = http_json(f"https://embed.gog.com/account/getFilteredProducts?mediaType=1&page={page}", gog_auth())
+        pages, page = d.get("totalPages", 1), page + 1
+        for g in d.get("products", []):
+            games[str(g["id"])] = {"title": g.get("title", g["id"]), "windows": (g.get("worksOn") or {}).get("Windows", True)}
+    return games
+
+
+def gog_install(name, gid):
+    """Downloads a game's Windows installer (every part of it) and returns the .exe to run."""
+    d = http_json(f"https://embed.gog.com/account/gameDetails/{gid}.json", gog_auth())
+    langs = {lang: files for lang, files in d.get("downloads", [])}  # [["English", {"windows": [...], "mac": [...]}], ...]
+    files = (langs.get("English") or next(iter(langs.values()), {})).get("windows")
+    if not files:
+        sys.exit("GOG has no Windows installer for this game")
+    parts = [fetch_authed(f"https://embed.gog.com{f['manualUrl']}", gog_auth(), CACHE / "gog" / gid) for f in files]
+    return next(p for p in parts if p.suffix.lower() == ".exe")  # setup_*.exe; its .bin parts sit beside it
+
+
+# itch.io: owned and claimed games, with a personal API key.
+def itch_auth():
+    k = store_file("itch.json").get("key") or sys.exit("connect itch.io first: python3 portal.py store login itch")
+    return {"Authorization": f"Bearer {k}"}
+
+
+def itch_windows(o):  # the API has said "windows" three ways over the years
+    return bool(o.get("p_windows") or "p_windows" in (o.get("traits") or []) or (o.get("platforms") or {}).get("windows"))
+
+
+def itch_list():
+    games = {}
+    for page in range(1, 200):
+        keys = http_json(f"https://api.itch.io/profile/owned-keys?page={page}", itch_auth()).get("owned_keys") or []
+        if not keys:
+            break
+        for k in keys:
+            g = k.get("game") or {}
+            games[str(k["id"])] = {"title": g.get("title", "?"), "game_id": k.get("game_id", g.get("id")), "windows": itch_windows(g)}
+    return games
+
+
+def itch_install(name, kid):
+    g = store_list("itch", refresh=False).get(kid) or sys.exit("unknown itch.io game; run: python3 portal.py store list itch")
+    ups = http_json(f"https://api.itch.io/games/{g['game_id']}/uploads?download_key_id={kid}", itch_auth()).get("uploads", [])
+    win = [u for u in ups if itch_windows(u) and not u.get("demo") and "demo" not in (u.get("traits") or [])]
+    if not win:
+        sys.exit("this game has no Windows download on itch.io")
+    u = win[0]  # the developer's first Windows upload is the main one
+    return fetch_authed(f"https://api.itch.io/uploads/{u['id']}/download?download_key_id={kid}", itch_auth(),
+                        CACHE / "itch" / kid, u.get("filename"))
+
+
+def store_cli(cmd, *a):
+    if cmd == "login":
+        print(store_login(*a))
+    elif cmd == "logout":
+        store_logout(*a)
+    elif cmd == "list":
+        for gid, g in store_list(*a).items():
+            print(f"{gid}\t{g['title']}" + (f"\t(installed in {g['installed']})" if g.get("installed") else ""))
+    elif cmd == "install":
+        print(store_install(*a))
+    elif cmd == "play":
+        p = store_play(*a)
+        if hasattr(p, "wait"):
+            p.wait()
+    else:
+        sys.exit(__doc__)
+
 
 def mac_app(name, target, title=None):
     title = (title or Path(target).stem).replace("/", "-")
@@ -591,8 +1136,12 @@ def mac_app(name, target, title=None):
         w, d = shlex.quote(str(DATA / "steamwebhelper.exe")), shlex.quote(str(steam.parent / "bin/cef/cef.win64"))
         fix = f'cmp -s {w} {d}/steamwebhelper.exe || {{ mv -f {d}/steamwebhelper.exe {d}/steamwebhelper_real.exe && cp {w} {d}/steamwebhelper.exe; }}\n'
         launch = f"{shlex.quote(str(steam))} -noverifyfiles" + (f" -applaunch {appid}" if appid else "")
-    script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(Path(target).parent))}\n{fix}"
-                      f"export {exports}\nexec {shlex.quote(wine(name))} start /unix {launch}\n")
+    if app := epic_app_of(name, target):  # via Legendary for its login token, so through this script
+        script.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} "
+                          f"store play epic {shlex.quote(app)}\n")
+    else:
+        script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(Path(target).parent))}\n{fix}"
+                          f"export {exports}\nexec {shlex.quote(wine(name))} start /unix {launch}\n")
     script.chmod(0o755)
     plist = {"CFBundleExecutable": "launch", "CFBundleName": title, "CFBundlePackageType": "APPL",
              "CFBundleIdentifier": f"local.windowsportal.{name}.{zlib.crc32(target.encode())}", "LSUIElement": True}
@@ -774,7 +1323,8 @@ def gui():
     root.configure(bg=BG)
     status = tk.StringVar()
     jobs = queue.Queue()  # worker threads never touch Tk; they post callables here
-    state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None}
+    state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None,
+             "stores": {}, "store_fetched": set()}  # filter ("store", key) shows that store's library
     images = {}  # Tk forgets images Python garbage-collects, so keep refs
 
     def ui(fn, *a):
@@ -825,7 +1375,7 @@ def gui():
 
     def pick_bottle():
         bs = bottles()
-        if state["filter"]:
+        if isinstance(state["filter"], str):  # a bottle is selected in the sidebar (not a store)
             return state["filter"]
         if not bs:
             messagebox.showinfo("Windows Portal", "Create a bottle first (Manage Bottles → New Bottle).")
@@ -901,7 +1451,8 @@ def gui():
     def draw_nav():
         for w in nav.winfo_children():
             w.destroy()
-        rows = [(None, "All Programs")] + ([("", "BOTTLES")] if bottles() else []) + [(b, b) for b in bottles()]
+        rows = [(None, "All Programs")] + ([("", "BOTTLES")] if bottles() else []) + [(b, b) for b in bottles()] + \
+               [("", "STORES")] + [(("store", k), v) for k, v in STORES.items()]
         for key, text in rows:
             if key == "":
                 tk.Label(nav, text=text, bg=SIDE, fg=DIM, font=("Helvetica", 10, "bold")).pack(anchor="w", padx=18, pady=(14, 4))
@@ -912,16 +1463,45 @@ def gui():
             l.pack(fill="x")
             l.bind("<Button-1>", lambda e, k=key: (state.update(filter=k, selected=None), draw_nav(), draw()))
 
+    def store_view():
+        f = state["filter"]
+        return f[1] if isinstance(f, tuple) else None
+
+    def store_items(store):
+        """Tiles for a store's library: (title, status, ("store", store, id, info), icon)."""
+        if store not in state["store_fetched"]:  # cached list now, the store's current one when it arrives
+            state["store_fetched"].add(store)
+            state["stores"][store] = store_list(store, refresh=False)
+
+            def work():
+                try:
+                    games = store_list(store)
+                    ui(lambda: (state["stores"].__setitem__(store, games), store_view() == store and draw()))
+                except (SystemExit, Exception) as e:
+                    ui(status.set, f"{STORES[store]}: {e}")
+            threading.Thread(target=work, daemon=True).start()
+        games = state["stores"].get(store) or {}
+        return [(g["title"], f"Installed in {g['installed']}" if g.get("installed") else
+                 ("Not installed" if g.get("windows", True) else "No Windows version"), ("store", store, gid, g), None)
+                for gid, g in sorted(games.items(), key=lambda i: (not i[1].get("installed"), str(i[1]["title"]).lower()))]
+
     def draw():
         for f, *_ in state["tiles"]:
             f.destroy()
         q = query.get().lower()
-        shown = [i for i in state["items"] if state["filter"] in (None, i[1]) and q in i[0].lower()]
-        heading.config(text=state["filter"] or "All Programs")
+        store = store_view()
+        if store:
+            shown = [i for i in store_items(store) if q in str(i[0]).lower()]
+            heading.config(text=STORES[store])
+        else:
+            shown = [i for i in state["items"] if state["filter"] in (None, i[1]) and q in i[0].lower()]
+            heading.config(text=state["filter"] or "All Programs")
         state["tiles"] = [tile(i) for i in shown]
         if not shown:
-            f = tk.Label(grid, bg=BG, fg=DIM, font=("Helvetica", 14), pady=40,
-                         text="No programs here yet.\nUse Install Software or Add Program on the left.")
+            text = ("No programs here yet.\nUse Install Software or Add Program on the left." if not store else
+                    "Install Steam in a bottle and sign in once:\nevery game you own shows up here." if store == "steam" else
+                    f"Connect your {STORES[store]} account below." if not store_connected(store) else "Loading your library…")
+            f = tk.Label(grid, bg=BG, fg=DIM, font=("Helvetica", 14), pady=40, text=text)
             state["tiles"] = [(f, None, lambda c: None)]
         layout()
         show_detail()
@@ -969,6 +1549,12 @@ def gui():
 
     def play(item):
         title, b, target, _ = item
+        if isinstance(target, tuple):  # a store game
+            _, store, gid, g = target
+            if not g.get("installed"):
+                return install_store_game(item)
+            bg(f"Starting {title}…", store_play, store, gid)
+            return
         appid = steam_appid_of(b, title)
         if appid and compat_blocked(compat(appid, cached_only=True)) and not messagebox.askyesno(
                 "Windows Portal", f"Highball's database says {title} won't run under Wine on a Mac: "
@@ -978,10 +1564,48 @@ def gui():
         status.set(f"Launched {title}")
         root.after(4000, lambda: status.get() == f"Launched {title}" and status.set(""))
 
+    def install_store_game(item):
+        title, _, (_, store, gid, g), _ = item
+        if store == "steam":  # Steam downloads it in the bottle it's owned in
+            bg(f"Opening Steam to install {title}…", store_install, store, gid, g["bottle"])
+            return
+        n = pick_bottle()
+        if n:
+            bg(f"Installing {title} into {n}… (large games take a while)", store_install, store, gid, n)
+
+    def connect_store(store):
+        url, how = STORE_LOGIN[store]
+        subprocess.run(["open", url])
+        code = simpledialog.askstring(f"Connect {STORES[store]}", f"{how}\n\nPaste it here:")
+        if code:
+            state["store_fetched"].discard(store)
+            bg(f"Connecting {STORES[store]}…", store_login, store, code)
+
+    def store_detail(store):
+        bar = tk.Frame(detail, bg=SIDE)
+        bar.pack(side="right", padx=24)
+        if store == "steam":
+            tk.Label(detail, text="Your Steam library comes from the Steam you're signed in to in a bottle.",
+                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
+        elif not store_connected(store):
+            tk.Label(detail, text=f"Not connected. Sign in once; Windows Portal keeps the login on this Mac.",
+                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
+            button(bar, f"Connect {STORES[store]}…", lambda: connect_store(store), True).pack(side="left", padx=4)
+            return
+        else:
+            tk.Label(detail, text="Select a game. Double-click to install or play.",
+                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
+            button(bar, "Disconnect", lambda: messagebox.askyesno("Windows Portal", f"Disconnect {STORES[store]}?")
+                   and (store_logout(store), state["stores"].pop(store, None), draw())).pack(side="left", padx=4)
+        button(bar, "Refresh", lambda: (state["store_fetched"].discard(store), draw())).pack(side="left", padx=4)
+
     def show_detail():
         for w in detail.winfo_children():
             w.destroy()
-        item = state["selected"] if state["selected"] in state["items"] else None
+        shown = [t[1] for t in state["tiles"]]
+        item = state["selected"] if state["selected"] in shown else None
+        if not item and store_view():
+            return store_detail(store_view())
         if not item:
             tk.Label(detail, text="Select a program to see its options. Double-click to play.",
                      bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(padx=24, pady=44, anchor="w")
@@ -990,14 +1614,27 @@ def gui():
         info = tk.Frame(detail, bg=SIDE)
         info.pack(side="left", padx=24)
         tk.Label(info, text=title, bg=SIDE, fg=FG, font=("Helvetica", 20, "bold")).pack(anchor="w")
-        tk.Label(info, text=f"Bottle: {b}  ·  {ENGINE_NAMES[engine(b)]}", bg=SIDE, fg=DIM).pack(anchor="w")
+        if isinstance(target, tuple):  # a store game
+            _, store, gid, g = target
+            tk.Label(info, text=f"{STORES[store]}  ·  {b}", bg=SIDE, fg=DIM).pack(anchor="w")
+            bar = tk.Frame(detail, bg=SIDE)
+            bar.pack(side="right", padx=24)
+            if g.get("installed"):
+                button(bar, "▶  Play", lambda: play(item), True).pack(side="left", padx=4)
+            elif g.get("windows", True):
+                button(bar, "Install…" if store != "steam" else "Install in Steam", lambda: install_store_game(item), True).pack(side="left", padx=4)
+            return
+        tk.Label(info, text=f"Bottle: {b}  ·  {ENGINE_NAMES[engine(b)]}  ·  graphics: {RENDERERS.get(graphics(b), graphics(b))}",
+                 bg=SIDE, fg=DIM).pack(anchor="w")
         if appid := steam_appid_of(b, title):  # compatibility verdict, fetched off the UI thread
             verdict = tk.Label(info, text="Checking compatibility…", bg=SIDE, fg=DIM, cursor="hand2")
             verdict.pack(anchor="w")
 
             def shown(d):
                 if verdict.winfo_exists():
-                    verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}  ↗",
+                    best = (d.get("game") or {}).get("renderer")
+                    hint = f" (Manage Bottles → Graphics… to switch)" if best in GRAPHICS[engine(b)] and best != graphics(b) else ""
+                    verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}{hint}  ↗",
                                    fg="#ff6b6b" if compat_blocked(d) else DIM)
                     verdict.bind("<Button-1>", lambda e: subprocess.run(["open", d.get("url", "https://gethighball.com/database/")]))
             threading.Thread(target=lambda: ui(shown, compat(appid)), daemon=True).start()
@@ -1062,7 +1699,7 @@ def gui():
         def fill():
             bl.delete(0, "end")
             for b in bottles():
-                bl.insert("end", f"{b}  ({engine(b)})")
+                bl.insert("end", f"{b}  ({engine(b)}, {graphics(b)})")
         state["manager"] = fill
         top.protocol("WM_DELETE_WINDOW", lambda: (state.update(manager=None), top.destroy()))
 
@@ -1076,7 +1713,7 @@ def gui():
             n = simpledialog.askstring("New bottle", "Bottle name:", parent=top)
             v = n and simpledialog.askstring("New bottle", "Windows version (win10, win11, win7, winxp64…):",
                                              initialvalue="win10", parent=top)
-            e = v and ask_engine(f"Engine for {n}", "wine" if ENGINES["wine"].exists() else "gptk")
+            e = v and ask_engine(f"Engine for {n}", next((e for e in ("wine10", "wine") if ENGINES[e].exists()), "gptk"))
             if e:
                 bg(f"Creating {n}…", new, n, v, e)
 
@@ -1103,6 +1740,30 @@ def gui():
                 "No restores Wine's default, where Command acts as Alt. Restart the bottle's programs afterwards.", parent=top)
             if on is not None:
                 bg(f"Updating {n}…", keys, n, on)
+
+        def do_graphics():
+            n = sel()
+            if not n:
+                return
+            opts = GRAPHICS[engine(n)]
+            g = simpledialog.askstring(f"Graphics for {n}", f"Currently: {graphics(n)}\n\n" + "\n".join(
+                f"  {o} = {RENDERERS[o]}" for o in opts) + ("\n\nDXMT and DXVK need the wine10 engine." if engine(n) == "gptk" else "")
+                + "\nRestart the bottle's programs afterwards.", initialvalue=graphics(n), parent=top)
+            if not g or g == graphics(n):
+                return
+            if g == "d3dmetal" and engine(n) == "wine10" and not d3dmetal_accepted():
+                if not messagebox.askyesno("D3DMetal license", D3DMETAL_LICENSE + "\n\nAccept?", parent=top):
+                    return
+                accept_d3dmetal(ask=False)
+            bg(f"Setting {n} to {g}…", set_graphics, n, g)
+
+        def do_sync():
+            n = sel()
+            m = n and simpledialog.askstring(
+                f"Sync mode for {n}", f"Currently: {sync_mode(n)}\n\nmsync: fastest for games\nesync: in between\n"
+                "none: needed for Steam's own window on this engine", initialvalue=sync_mode(n), parent=top)
+            if m:
+                bg(f"Setting {n} to {m}…", sync_mode, n, m)
 
         def do_engine():
             n = sel()
@@ -1134,11 +1795,16 @@ def gui():
                 state["filter"] = None if state["filter"] == n else state["filter"]
                 bg(f"Deleting {n}…", delete, n)
 
+        if not ENGINES["wine10"].exists():
+            tk.Button(bar, text="Get Wine 10 Engine", width=16, command=guarded(
+                lambda: bg("Downloading the Wine 10 engine (~250 MB)…", get_engine, "wine10"))).pack(pady=2)
         for label, fn in [("New Bottle…", do_new),
                           ("Run Program…", do_run),
                           ("Open C: Drive", lambda: (n := sel()) and drive_c(n)),
                           ("Engine…", do_engine),
                           ("Windows Version…", do_winver),
+                          ("Graphics…", do_graphics),
+                          ("Sync Mode…", do_sync),
                           ("Mac Shortcuts…", do_keys),
                           ("Wine Config", lambda: (n := sel()) and run(n, "winecfg", wait=False)),
                           ("Winetricks", lambda: (n := sel()) and bg("Winetricks open…", tricks, n)),
@@ -1163,6 +1829,9 @@ if __name__ == "__main__":
     cmds = {"gui": gui, "setup": setup, "package": package,
             "engine": lambda n, e=None: set_engine(n, e) if e else print(engine(n)),
             "winver": lambda n, v=None: print(winver(n, v)), "keys": lambda n, v=None: print(keys(n, v)),
+            "store": store_cli, "get-engine": get_engine, "accept-d3dmetal": accept_d3dmetal,
+            "graphics": lambda n, g=None: print(set_graphics(n, g) if g else graphics(n)),
+            "sync": lambda n, m=None: print(sync_mode(n, m)),
             "compat": lambda g, *more: print(compat_report(" ".join((g, *more)))), "new": new, "run": run, "tricks": tricks, "install": install, "steam-sync": lambda: print(sync_steam()), "add": add_program, "remove": remove_program,
             "app": lambda n, f, t=None: print(mac_app(n, f, t)), "kill": kill, "export": export,
             "import": import_, "delete": delete, "c": drive_c, "config": lambda n: run(n, "winecfg"),
