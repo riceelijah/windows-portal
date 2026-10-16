@@ -296,8 +296,9 @@ def arm64_missing():
     """Why the native engine can't run on this Mac, or None."""
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         return "the native engine is for Apple Silicon Macs"
-    if tuple(int(x) for x in (platform.mac_ver()[0] or "0").split(".")[:1]) < (15,):
-        return "the native engine needs macOS 15 or later"
+    # The signed loader sets memory ordering per thread, which macOS has allowed since 26.5 (Highball's helper says so)
+    if tuple(int(x) for x in ((platform.mac_ver()[0] or "0") + ".0").split(".")[:2]) < (26, 5):
+        return "the native engine needs macOS 26.5 or later"
     if not wineloader():
         return ("the native engine needs Highball's signed Wine loader: install Highball (gethighball.com), "
                 "or set WINDOWSPORTAL_WINELOADER to a signed loader")

@@ -31,8 +31,8 @@ Highball's preview, `arm64-wine11.18-r1` (15 October 2026):
 | renderers | vkd3d-proton 3.1 and DXVK 3.1, ARM64EC | 11.8 MB | `9476a69f…c577e15136` |
 
 Measured by Highball on a base M4 with macOS 27.0: Flight Simulator 2024 runs at 15–20 fps on the Medium preset at
-1080p, stable over 25 minutes. That was through their test harness, not yet through their app's installer. It
-requires macOS 15 or later.
+1080p, stable over 25 minutes. That was through their test harness, not yet through their app's installer. Highball's engine manifest says macOS 15 or later, but its signed loader
+helper requires 26.5, so 26.5 is the real minimum.
 
 ## The blocker: a restricted Apple entitlement
 
