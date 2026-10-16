@@ -8,6 +8,8 @@
                                            # ENGINE: wine (Wine 11, default) or gptk (DirectX 12 games)
   python3 portal.py engine NAME [ENGINE]   # show or switch a bottle's engine
   python3 portal.py winver NAME [WINVER]   # show or change the Windows version (restart its programs after)
+  python3 portal.py keys NAME [on|off]     # Command as Ctrl, Option as Alt (Mac copy/paste); on for new bottles
+  python3 portal.py compat GAME            # will it run? Steam app id or title, from Highball's open database
   python3 portal.py list
   python3 portal.py catalog                # software the installer knows about
   python3 portal.py install NAME ITEM      # catalog item, or a path to an .exe/.msi/zip/7z/rar
@@ -28,7 +30,7 @@ Every bottle is 64-bit and runs 32-bit programs too (WoW64); this Wine can't mak
 Add your own installers to ~/Library/Application Support/WindowsPortal/catalog.json:
   {"My App": {"url": "https://.../setup.exe", "file": "myapp-setup.exe", "tricks": ["vcrun2022"]}}
 """
-import base64, json, os, re, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile, urllib.request
+import base64, json, os, platform, re, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile, urllib.error, urllib.request
 from pathlib import Path
 
 DATA = Path.home() / "Library/Application Support/WindowsPortal"
@@ -105,6 +107,9 @@ def env(name):
 
 
 def setup():
+    # Both engines are Intel builds; without Rosetta every wine call fails with "bad CPU type".
+    if platform.machine() == "arm64" and subprocess.run(["arch", "-x86_64", "/usr/bin/true"], capture_output=True).returncode:
+        subprocess.run(["softwareupdate", "--install-rosetta", "--agree-to-license"], check=True)
     # Homebrew's own Wine casks were disabled 2026-09-01 (Gatekeeper); Gcenx's GPTK build still installs.
     subprocess.run(["brew", "tap", "gcenx/wine"], check=True)
     subprocess.run(["brew", "trust", "gcenx/wine"], check=True)
@@ -142,6 +147,25 @@ def new(name, winver="win10", eng=None):
     w = wine(name)
     subprocess.run([w, "wineboot", "--init"], env=env(name), check=True)
     subprocess.run([w, "winecfg", "-v", winver], env=env(name), check=True)
+    keys(name, True)
+
+
+MAC_KEYS = ("LeftCommandIsCtrl", "RightCommandIsCtrl", "LeftOptionIsAlt", "RightOptionIsAlt")
+
+
+def keys(name, on=None):
+    """Shows or sets whether Command acts as Ctrl (so ⌘C/⌘V/⌘A work) and Option as Alt.
+    Wine's default makes Command act as Alt; Option is remapped too, else Alt is unreachable."""
+    k = r"HKCU\Software\Wine\Mac Driver"
+    if on is None:
+        out = subprocess.run([wine(name), "reg", "query", k, "/v", MAC_KEYS[0]], env=env(name), capture_output=True, text=True).stdout
+        return "on" if re.search(r"REG_SZ\s+y", out) else "off"
+    if isinstance(on, str):
+        on = {"on": True, "off": False}.get(on) if on in ("on", "off") else sys.exit("keys: use on or off")
+    for v in MAC_KEYS:  # REG_SZ "y"/"n": the Mac driver ignores a DWORD here
+        subprocess.run([wine(name), "reg", "add", k, "/v", v, "/t", "REG_SZ", "/d", "y" if on else "n", "/f"],
+                       env=env(name), check=True, capture_output=True)
+    return "on" if on else "off"  # applies to programs started after this
 
 
 def winver(name, ver=None):
@@ -270,10 +294,16 @@ def download(url, file):
     CACHE.mkdir(parents=True, exist_ok=True)
     dest = CACHE / Path(file).name
     if not dest.exists():
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req) as r, open(dest.with_suffix(".part"), "wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)  # streamed, never the whole installer in memory
-        dest.with_suffix(".part").rename(dest)
+        part = dest.with_suffix(".part")
+        have = part.stat().st_size if part.exists() else 0  # an interrupted download picks up where it stopped
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **({"Range": f"bytes={have}-"} if have else {})})
+        try:
+            with urllib.request.urlopen(req) as r, open(part, "ab" if r.status == 206 else "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)  # streamed, never the whole installer in memory
+        except urllib.error.HTTPError as e:
+            if e.code != 416:  # 416: the .part already holds the whole file
+                raise
+        part.rename(dest)
     return dest
 
 
@@ -432,7 +462,8 @@ def _sync_steam():
     for appid, (src, title, folder, stamp) in changed.items():  # new or updated in Steam
         if appid in synced:
             unplace_steam_game(synced[appid])
-        if uses_dx12(folder):
+        # D3DMetal is GPTK's: DirectX 12 needs it, and Highball's database names it best for some DX11 games too.
+        if uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal":
             if not (HOME / STEAM_BOTTLE).exists():
                 if not ENGINES["gptk"].exists():
                     sys.exit("DirectX 12 games need Game Porting Toolkit; run: python3 portal.py setup")
@@ -455,6 +486,93 @@ def _sync_steam():
         synced[appid] = {"title": title, "dir": folder.name, "stamp": stamp, "bottle": where}
     f.write_text(json.dumps(synced, indent=1))
     return {"added or updated": [f"{found[a][1]} ({synced[a]['bottle']})" for a in changed], "removed": gone}
+
+
+# Highball's open compatibility database (github.com/gauthierpiarrette/highball-db): per-game verdicts for Wine on
+# Apple Silicon. Curated entries are CC0; "prediction" entries are ProtonDB-derived (ODbL), so they're labelled as such.
+COMPAT_URL = "https://gethighball.com/data/steam/{}.json"
+COMPAT_INDEX = "https://gethighball.com/data/games.json"
+COMPAT_STATUS = {"verified-local": "Verified by Highball", "community": "Community reports say it runs",
+                 "reported-upstream": "Reported working upstream", "blocked-anticheat": "Won't run: kernel anti-cheat",
+                 "blocked-publisher": "Won't run: blocked by the publisher"}
+RENDERERS = {"d3dmetal": "D3DMetal (the gptk engine)", "dxmt": "DXMT", "dxvk": "DXVK", "wined3d": "WineD3D"}
+
+
+def compat_fetch(url, file, max_age=7 * 86400, cached_only=False):
+    """JSON from url cached in CACHE/compat/file; None on 404, {} when offline with nothing cached."""
+    out = CACHE / "compat" / file
+    fresh = out.exists() and time.time() - out.stat().st_mtime < max_age
+    if fresh or cached_only:
+        return json.loads(out.read_text()) if out.exists() else {}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "WindowsPortal"}), timeout=10) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return json.loads(out.read_text()) if out.exists() else {}
+        data = None  # nothing known about it: cache that too
+    except (OSError, ValueError):  # offline or garbled: a stale answer beats none
+        return json.loads(out.read_text()) if out.exists() else {}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data))
+    return data
+
+
+def compat(appid, cached_only=False):
+    """Highball's entry for a Steam app id: {"game": {...}} curated, {"prediction": {...}} odds, or {} if unknown."""
+    return compat_fetch(COMPAT_URL.format(int(appid)), f"{int(appid)}.json", cached_only=cached_only) or {}
+
+
+def compat_verdict(d):
+    """One line for the library, e.g. 'Community reports say it runs · best on DXVK'; None if unknown."""
+    if g := d.get("game"):
+        line = COMPAT_STATUS.get(g.get("status"), g.get("status") or "Unknown")
+        return line + (f" · best on {RENDERERS.get(g['renderer'], g['renderer'])}" if g.get("renderer") else "")
+    if d.get("prediction"):
+        return f"{d.get('label', d['prediction'].get('macPrediction'))} (prediction from Linux reports, ODbL)"
+    return None
+
+
+def compat_blocked(d):
+    return (d.get("game") or {}).get("status", "").startswith("blocked")
+
+
+def compat_report(game):
+    """Text report for `compat`: a Steam app id, or a title looked up in installed Steam games, then the database."""
+    if not str(game).isdigit():
+        q = game.lower()
+        installed = {t: a for b in bottles() if (bottle(b) / "drive_c/Program Files (x86)/Steam/steamapps").is_dir()
+                     for a, t, *_ in steam_games(b)}
+        index = (compat_fetch(COMPAT_INDEX, "games.json", max_age=86400) or {}).get("games", [])
+        hits = [(t, a) for t, a in installed.items() if q in t.lower()] + \
+               [(g["title"], g["steam_appid"]) for g in index if q in g["title"].lower() and g.get("steam_appid")]
+        if not hits:
+            return f"{game!r} isn't in Highball's database. Try its Steam app id (the number in its store URL)."
+        exact = [h for h in hits if h[0].lower() == q]
+        if len({a for _, a in hits}) > 1 and not exact:
+            return "Which one?\n" + "\n".join(f"  {a}\t{t}" for t, a in dict.fromkeys(hits))
+        game = (exact or hits)[0][1]
+    d = compat(game)
+    if not d:
+        return f"No data for Steam app {game} (or offline). Browse https://gethighball.com/database/"
+    g = d.get("game") or d.get("prediction", {})
+    lines = [f"{g.get('title', game)} (Steam {game}): {compat_verdict(d)}"]
+    if d.get("game"):
+        lines += [f"  {g['notes']}"] if g.get("notes") else []
+        lines += [f"  Known issue: {i['symptom']}\n    Fix: {i['fix']}" for i in g.get("knownIssues") or []]
+        if g.get("anticheat"):
+            lines.append(f"  Anti-cheat: {', '.join(g['anticheat'].get('names', []))}")
+    else:
+        lines.append(f"  {d.get('note', '')} ProtonDB tier: {g.get('protonTier')}.")
+    lines.append(f"  {d.get('url', 'https://gethighball.com/database/')}  (data: {d.get('license')}, highball-db)")
+    return "\n".join(lines)
+
+
+def steam_appid_of(name, title):
+    """Steam app id of a library entry steam_sync placed, else None."""
+    f = DATA / "steam_sync.json"
+    synced = json.loads(f.read_text()) if f.exists() else {}
+    return next((a for a, e in synced.items() if e["title"] == title and e.get("bottle", STEAM_BOTTLE) == name), None)
 
 
 def mac_app(name, target, title=None):
@@ -851,6 +969,11 @@ def gui():
 
     def play(item):
         title, b, target, _ = item
+        appid = steam_appid_of(b, title)
+        if appid and compat_blocked(compat(appid, cached_only=True)) and not messagebox.askyesno(
+                "Windows Portal", f"Highball's database says {title} won't run under Wine on a Mac: "
+                f"{compat_verdict(compat(appid, cached_only=True))}.\n\nLaunch anyway?"):
+            return
         run(b, target, wait=False)
         status.set(f"Launched {title}")
         root.after(4000, lambda: status.get() == f"Launched {title}" and status.set(""))
@@ -868,6 +991,16 @@ def gui():
         info.pack(side="left", padx=24)
         tk.Label(info, text=title, bg=SIDE, fg=FG, font=("Helvetica", 20, "bold")).pack(anchor="w")
         tk.Label(info, text=f"Bottle: {b}  ·  {ENGINE_NAMES[engine(b)]}", bg=SIDE, fg=DIM).pack(anchor="w")
+        if appid := steam_appid_of(b, title):  # compatibility verdict, fetched off the UI thread
+            verdict = tk.Label(info, text="Checking compatibility…", bg=SIDE, fg=DIM, cursor="hand2")
+            verdict.pack(anchor="w")
+
+            def shown(d):
+                if verdict.winfo_exists():
+                    verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}  ↗",
+                                   fg="#ff6b6b" if compat_blocked(d) else DIM)
+                    verdict.bind("<Button-1>", lambda e: subprocess.run(["open", d.get("url", "https://gethighball.com/database/")]))
+            threading.Thread(target=lambda: ui(shown, compat(appid)), daemon=True).start()
         bar = tk.Frame(detail, bg=SIDE)
         bar.pack(side="right", padx=24)
         added = title in library().get(b, {})
@@ -963,6 +1096,14 @@ def gui():
             if v:
                 bg(f"Setting {n} to {v}…", winver, n, v)
 
+        def do_keys():
+            n = sel()
+            on = n and messagebox.askyesnocancel(
+                f"Keyboard for {n}", f"Currently {keys(n)}.\n\nMake Command act as Ctrl (⌘C, ⌘V, ⌘A work) and Option as Alt?\n"
+                "No restores Wine's default, where Command acts as Alt. Restart the bottle's programs afterwards.", parent=top)
+            if on is not None:
+                bg(f"Updating {n}…", keys, n, on)
+
         def do_engine():
             n = sel()
             e = n and ask_engine(f"Engine for {n}", engine(n))
@@ -998,6 +1139,7 @@ def gui():
                           ("Open C: Drive", lambda: (n := sel()) and drive_c(n)),
                           ("Engine…", do_engine),
                           ("Windows Version…", do_winver),
+                          ("Mac Shortcuts…", do_keys),
                           ("Wine Config", lambda: (n := sel()) and run(n, "winecfg", wait=False)),
                           ("Winetricks", lambda: (n := sel()) and bg("Winetricks open…", tricks, n)),
                           ("Force Quit", lambda: (n := sel()) and kill(n)),
@@ -1020,7 +1162,8 @@ if __name__ == "__main__":
     cmd, *a = sys.argv[1:] or ["gui"]
     cmds = {"gui": gui, "setup": setup, "package": package,
             "engine": lambda n, e=None: set_engine(n, e) if e else print(engine(n)),
-            "winver": lambda n, v=None: print(winver(n, v)), "new": new, "run": run, "tricks": tricks, "install": install, "steam-sync": lambda: print(sync_steam()), "add": add_program, "remove": remove_program,
+            "winver": lambda n, v=None: print(winver(n, v)), "keys": lambda n, v=None: print(keys(n, v)),
+            "compat": lambda g, *more: print(compat_report(" ".join((g, *more)))), "new": new, "run": run, "tricks": tricks, "install": install, "steam-sync": lambda: print(sync_steam()), "add": add_program, "remove": remove_program,
             "app": lambda n, f, t=None: print(mac_app(n, f, t)), "kill": kill, "export": export,
             "import": import_, "delete": delete, "c": drive_c, "config": lambda n: run(n, "winecfg"),
             "list": lambda: print("\n".join(bottles())), "catalog": lambda: print("\n".join(catalog())),
