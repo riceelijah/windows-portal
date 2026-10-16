@@ -8,12 +8,14 @@
                                            # ENGINE: wine10 (default once installed), wine (Wine 11) or gptk
   python3 portal.py engine NAME [ENGINE]   # show or switch a bottle's engine
   python3 portal.py get-engine wine10      # Wine 10 with DXMT, D3DMetal and DXVK (~250 MB)
-  python3 portal.py graphics NAME [LAYER]  # show or set a bottle's graphics layer: dxmt, d3dmetal, dxvk, wined3d
+  python3 portal.py get-engine arm64       # preview: native Apple Silicon Wine, no Rosetta (~415 MB; needs Highball.app)
+  python3 portal.py graphics NAME [LAYER]  # show or set a bottle's graphics layer: dxmt, d3dmetal, dxvk, vkd3d, wined3d
   python3 portal.py accept-d3dmetal        # read and accept Apple's license, needed for d3dmetal on wine10
   python3 portal.py sync NAME [MODE]       # wine10 bottles: msync (fastest, default), esync or none (Steam's window)
   python3 portal.py display NAME [MODE]    # standard, retina (sharp, full resolution) or compact (retina, smaller text)
   python3 portal.py game NAME PROGRAM [SETTING VALUE]  # per-game: graphics LAYER|default, mouse enable|force|disable|default
   python3 portal.py steam-repair NAME      # stop everything in the bottle, clear Steam's web cache, start Steam, check it
+  python3 portal.py copy-games FROM TO     # clone C:\\Games into another bottle (e.g. a new native one)
   python3 portal.py art-key KEY            # SteamGridDB API key, for cover art of games not on Steam
   python3 portal.py winver NAME [WINVER]   # show or change the Windows version (restart its programs after)
   python3 portal.py keys NAME [on|off]     # Command as Ctrl, Option as Alt (Mac copy/paste); on for new bottles
@@ -57,17 +59,26 @@ WINE_SHA256 = "aa0ea4c82e636ae7bca2076387cb0a5affa26509ad13f119ecd0d62bd7ba6f82"
 # Sikarugir's Wine 10 (built from the CrossOver tree's Mac work) plus its runtime: MoltenVK, GStreamer and the graphics
 # layers (DXMT, D3DMetal, DXVK). Plain WineHQ builds lack the Mac driver hooks DXMT and D3DMetal need, and msync.
 SIK = DATA / "engines/sikarugir-10.0_6"
+# Preview: Highball's native Apple Silicon Wine (WineHQ 11.18 for arm64; x86 programs run through FEX, not Rosetta).
+# Its loader needs Apple's cross-architecture entitlement, which only a signed app can carry, so it runs through the
+# signed WineLoader helper inside Highball.app (docs/arm64-engine-plan.md, option A).
+ARM = DATA / "engines/arm64-wine11.18-r1"
+WINELOADER_PATHS = [Path(os.environ["WINDOWSPORTAL_WINELOADER"])] if os.environ.get("WINDOWSPORTAL_WINELOADER") else [
+    Path(a) / "Highball.app/Contents/Helpers/WineLoader.app/Contents/MacOS/wine" for a in ("/Applications", Path.home() / "Applications")]
 ENGINES = {  # per bottle
     "wine10": SIK / "wswine.bundle/bin/wine",
+    "arm64": ARM / "engine/bin/wine",
     "wine": DATA / f"engines/wine-{WINE_VERSION}/Wine Devel.app/Contents/Resources/wine/bin/wine",
     "gptk": Path("/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"),
 }
-ENGINE_NAMES = {"wine10": "Wine 10 (DXMT, D3DMetal, DXVK)", "wine": f"Wine {WINE_VERSION}", "gptk": "Game Porting Toolkit (DirectX 12)"}
+ENGINE_NAMES = {"wine10": "Wine 10 (DXMT, D3DMetal, DXVK)", "arm64": "Native Apple Silicon (preview)",
+                "wine": f"Wine {WINE_VERSION}", "gptk": "Game Porting Toolkit (DirectX 12)"}
 ENGINE_AGE = {"gptk": 0, "wine10": 1, "wine": 2}  # Wine upgrades a prefix it opens; an older Wine can't open it after
 GRAPHICS = {  # layers each engine can use, default first
     "wine10": ["dxmt", "d3dmetal", "dxvk", "wined3d"],
     "wine": ["wined3d", "dxvk"],  # DXVK here is experimental: these DXVK builds were made for CrossOver-tree Wine
     "gptk": ["d3dmetal"],
+    "arm64": ["vkd3d", "dxvk", "wined3d"],  # no D3DMetal or DXMT on arm64; vkd3d's folder also serves DirectX 10/11
 }
 PINNED = {  # download: (url, sha256). Pinned, so a changed file is refused rather than run.
     "wine": (WINE_URL, WINE_SHA256),
@@ -81,6 +92,13 @@ PINNED = {  # download: (url, sha256). Pinned, so a changed file is refused rath
                   "28f5f7d0eb8c029679d4faaa483ec85888af17a9a75977ae9170c21d8ce3428b"),
     "nile": ("https://github.com/imLinguin/nile/releases/download/v1.2.0/nile_macOS_arm64",
              "6cc74eb19117c8c309b0b94657e1e267642a3b4840d7386a133dcf6f3bffeab0"),
+    # Highball's arm64-wine11.18-r1 (highball/spike/engines/arm64-wine11.18-r1.json)
+    "arm64": ("https://github.com/gauthierpiarrette/highball-engine/releases/download/engine-arm64-wine-11.18-20261015T181931Z-arm64-r1/engine-arm64-wine-11.18-20261015T181931Z-arm64-r1.tar.gz",
+              "01dd2f619367968bfdd38d41042a24704c99811be5c08fc219f87c63fdb19fb0"),
+    "arm64-moltenvk": ("https://github.com/gauthierpiarrette/highball-engine/releases/download/moltenvk-arm64-1.4.2-20261015T181815Z-arm64-r1/moltenvk-arm64-1.4.2-20261015T181815Z-arm64-r1.tar.gz",
+                       "feaab38ab4a991f145f4db10e922d247e25c5722e0873a9285ba1cb477d18496"),
+    "arm64-renderers": ("https://github.com/gauthierpiarrette/highball-engine/releases/download/renderers-arm64-20261015T181326Z-arm64-r1/renderers-arm64-20261015T181326Z-arm64-r1.tar.gz",
+                        "9476a69f2b4fc63c4da25888e1d36a41e5f1884f7c39809e1c03c1c577e15136"),
 }
 D3DMETAL_LICENSE = ("D3DMetal is Apple's, from the Game Porting Toolkit. Apple's license allows non-commercial use only, "
                     "to develop, test or evaluate games on Apple hardware, and forbids modifying or redistributing it.")
@@ -118,7 +136,10 @@ def set_engine(name, eng):
         sys.exit(f"unknown engine {eng!r}; choose from: {', '.join(ENGINES)}")
     if (bottle(name) / "portal.json").exists():
         old = engine(name)
-        if ENGINE_AGE[eng] < ENGINE_AGE[old] and (bottle(name) / "system.reg").exists():
+        if (eng == "arm64") != (old == "arm64") and (bottle(name) / "system.reg").exists():
+            sys.exit(f"{name} was set up by {ENGINE_NAMES[old]}; bottles don't move between the native engine and the "
+                     f"Intel ones. Make a new bottle with the {eng} engine (python3 portal.py copy-games can bring games over).")
+        if eng != "arm64" and old != "arm64" and ENGINE_AGE[eng] < ENGINE_AGE[old] and (bottle(name) / "system.reg").exists():
             sys.exit(f"{name} has been upgraded by {ENGINE_NAMES[old]}; the older Wine in {ENGINE_NAMES[eng]} can't open it "
                      f"reliably. Make a new bottle with the {eng} engine instead.")
         kill(name)  # stop the old engine's wineserver before the other one touches the bottle
@@ -256,10 +277,49 @@ def sync_mode(name, mode=None):
 
 
 def wine(name):
-    p = ENGINES[engine(name)]
+    eng = engine(name)
+    if eng == "arm64":
+        link_wineloader()  # Highball.app may have moved or updated since the last launch
+    p = ENGINES[eng]
     if not p.exists():
-        sys.exit(f"{ENGINE_NAMES[engine(name)]} isn't installed. Run: python3 portal.py setup")
+        sys.exit(f"{ENGINE_NAMES[eng]} isn't installed. Run: python3 portal.py "
+                 + ("get-engine arm64" if eng == "arm64" else "get-engine wine10" if eng == "wine10" else "setup"))
     return str(p)
+
+
+def wineloader():
+    """The signed Wine loader in Highball.app, or None."""
+    return next((p for p in WINELOADER_PATHS if p.is_file()), None)
+
+
+def arm64_missing():
+    """Why the native engine can't run on this Mac, or None."""
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return "the native engine is for Apple Silicon Macs"
+    if tuple(int(x) for x in (platform.mac_ver()[0] or "0").split(".")[:1]) < (15,):
+        return "the native engine needs macOS 15 or later"
+    if not wineloader():
+        return ("the native engine needs Highball's signed Wine loader: install Highball (gethighball.com), "
+                "or set WINDOWSPORTAL_WINELOADER to a signed loader")
+    return None
+
+
+def link_wineloader():
+    """Points the engine's loaders at the signed one: lib/wine/aarch64-unix/wine -> the helper, bin/wine -> that.
+    The helper finds ntdll.so beside each symlink it was started through, so nothing is copied into Highball.app.
+    The engine's own unsigned loaders are kept as *.unsigned."""
+    helper = wineloader()
+    if not helper or not (ARM / "engine").is_dir():
+        return
+    for link, target in ((ARM / "engine/lib/wine/aarch64-unix/wine", str(helper)),
+                         (ARM / "engine/bin/wine", "../lib/wine/aarch64-unix/wine")):
+        if link.is_symlink():
+            if os.readlink(link) == target:
+                continue
+            link.unlink()
+        elif link.exists():
+            link.replace(link.with_name("wine.unsigned"))
+        link.symlink_to(target)
 
 
 def bottle(name, exists=True):
@@ -279,7 +339,7 @@ def wine_env(name, target=None):
             # Steam passes its environment to the games it launches, so this covers them too.
             "WINEDLLOVERRIDES": ";".join([os.environ.get("WINEDLLOVERRIDES", "winemenubuilder.exe=d;gameoverlayrenderer=d"),
                                           *overrides]),
-            "ROSETTA_ADVERTISE_AVX": "1", **extra}
+            **({} if engine(name) == "arm64" else {"ROSETTA_ADVERTISE_AVX": "1"}), **extra}
 
 
 def engine_env(name, target=None):
@@ -305,6 +365,18 @@ def engine_env(name, target=None):
                        DYLD_FALLBACK_FRAMEWORK_PATH=f"{fw}:{ext}")
         if layer == "dxvk":
             overrides.append("dxgi,d3d9,d3d10core,d3d11=n,b")
+    elif eng == "arm64":
+        env = {"GST_PLUGIN_PATH": str(ARM / "frameworks/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0"),
+               "MVK_CONFIG_SHADER_SOURCE_COMPRESSION_ALGORITHM": "1",  # the shader cache it keeps stays small
+               "MVK_CONFIG_RESUME_LOST_DEVICE": "1", "DXVK_RELAX_FEATURES": "1"}
+        if layer in ("vkd3d", "dxvk"):
+            env["WINEDLLPATH_PREPEND"] = str(ARM / "renderers" / layer / "wine")
+        if layer == "vkd3d":  # MoltenVK reports neither feature level nor shader model honestly: declare D3DMetal's
+            overrides.append("dxgi,d3d11,d3d10core,d3d12,d3d12core=n,b")
+            env.update(VKD3D_RELAX_DEVICE_CAPS="1", VKD3D_FEATURE_LEVEL="12_0", VKD3D_SHADER_MODEL="6_6",
+                       VKD3D_SHADER_CACHE_PATH="C:\\vkd3d-cache\\arm64-wine11.18-r1")  # per engine build, in the bottle
+        elif layer == "dxvk":
+            overrides.append("dxgi,d3d10core,d3d11=n,b")  # Direct3D 9 stays Wine's own on this line
     return env, overrides
 
 
@@ -323,9 +395,12 @@ def fetch(what):
 
 
 def get_engine(eng="wine10"):
-    """Installs the wine10 engine: Sikarugir's Wine 10 and its runtime (MoltenVK, GStreamer, graphics layers)."""
+    """Installs the wine10 engine (Sikarugir's Wine 10 and its runtime: MoltenVK, GStreamer, graphics layers), or the
+    native arm64 preview."""
+    if eng == "arm64":
+        return get_arm64()
     if eng != "wine10":
-        sys.exit("get-engine installs wine10; the others come with: python3 portal.py setup")
+        sys.exit("get-engine installs wine10 or arm64; the others come with: python3 portal.py setup")
     if ENGINES["wine10"].exists():
         return
     tmp = SIK.with_name(SIK.name + ".part")  # renamed when complete, so a half-unpacked engine never looks installed
@@ -337,6 +412,43 @@ def get_engine(eng="wine10"):
         subprocess.run(["tar", "-xf", str(f), "-C", str(dest), *only], check=True)
         f.unlink()
     tmp.rename(SIK)
+
+
+def get_arm64():
+    if why := arm64_missing():
+        sys.exit(why)
+    if not ENGINES["arm64"].exists():
+        tmp = ARM.with_name(ARM.name + ".part")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for part in ("arm64", "arm64-moltenvk", "arm64-renderers"):
+            f = fetch(part)
+            dest = tmp / "moltenvk" if part == "arm64-moltenvk" else tmp
+            dest.mkdir(exist_ok=True)
+            subprocess.run(["tar", "-xf", str(f), "-C", str(dest)], check=True)
+            f.unlink()
+        # Highball's patched MoltenVK replaces the archive's: winevulkan opens the one in engine/lib on this line
+        (tmp / "moltenvk/lib/libMoltenVK.dylib").replace(tmp / "engine/lib/libMoltenVK.dylib")
+        shutil.rmtree(tmp / "moltenvk")
+        for f in tmp.rglob("._*"):  # AppleDouble leftovers from the archive make GStreamer log a warning per plugin
+            f.unlink()
+        tmp.rename(ARM)
+    link_wineloader()
+
+
+def copy_games(src, dest):
+    """Clones a bottle's C:\\Games into another (APFS copy-on-write: instant, no extra disk). For moving to the native
+    engine, whose bottles can't be converted. Installers and Steam libraries still need setting up in the new one."""
+    s, d = bottle(src) / "drive_c/Games", bottle(dest) / "drive_c/Games"
+    if not s.is_dir():
+        sys.exit(f"{src} has no C:\\Games")
+    d.mkdir(parents=True, exist_ok=True)
+    for game in s.iterdir():
+        if not (d / game.name).exists():
+            subprocess.run(["cp", "-cR", str(game), str(d / game.name)], check=True)
+            if exe := main_exe(d / game.name):
+                add_program(dest, str(exe), game.name)
+    return sorted(p.name for p in d.iterdir())
 
 
 def install_dxvk(name):
@@ -764,7 +876,7 @@ def _sync_steam():
             unplace_steam_game(synced[appid])
         # D3DMetal is GPTK's: DirectX 12 needs it, and Highball's database names it best for some DX11 games too.
         # A wine10 bottle has D3DMetal itself, so its games stay with its Steam.
-        if engine(src) != "wine10" and (uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal"):
+        if engine(src) not in ("wine10", "arm64") and (uses_dx12(folder) or (compat(appid).get("game") or {}).get("renderer") == "d3dmetal"):
             if not (HOME / STEAM_BOTTLE).exists():
                 if not ENGINES["gptk"].exists():
                     sys.exit("DirectX 12 games need Game Porting Toolkit; run: python3 portal.py setup")
@@ -796,7 +908,8 @@ COMPAT_INDEX = "https://gethighball.com/data/games.json"
 COMPAT_STATUS = {"verified-local": "Verified by Highball", "community": "Community reports say it runs",
                  "reported-upstream": "Reported working upstream", "blocked-anticheat": "Won't run: kernel anti-cheat",
                  "blocked-publisher": "Won't run: blocked by the publisher"}
-RENDERERS = {"d3dmetal": "D3DMetal (the gptk engine)", "dxmt": "DXMT", "dxvk": "DXVK", "wined3d": "WineD3D"}
+RENDERERS = {"d3dmetal": "D3DMetal (the gptk engine)", "dxmt": "DXMT", "dxvk": "DXVK", "wined3d": "WineD3D",
+             "vkd3d": "vkd3d-proton (DirectX 12)"}
 
 
 def compat_fetch(url, file, max_age=7 * 86400, cached_only=False):
@@ -1928,7 +2041,8 @@ def gui():
         def shown(d):
             if verdict.winfo_exists():
                 best = (d.get("game") or {}).get("renderer")
-                hint = (f" (Graphics… to switch)" if b and best in GRAPHICS[engine(b)] and best != graphics(b) else "")
+                hint = (f" (Graphics… to switch)" if b and best in GRAPHICS[engine(b)] and best != graphics(b) else
+                        " (not on the native engine)" if b and engine(b) == "arm64" and best in ("d3dmetal", "dxmt") else "")
                 verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}{hint}  ↗",
                                fg="#ff6b6b" if compat_blocked(d) else DIM)
                 verdict.bind("<Button-1>", lambda e: subprocess.run(["open", d.get("url", "https://gethighball.com/database/")]))
@@ -2161,6 +2275,16 @@ def gui():
         if not ENGINES["wine10"].exists():
             tk.Button(bar, text="Get Wine 10 Engine", width=16, command=guarded(
                 lambda: bg("Downloading the Wine 10 engine (~250 MB)…", get_engine, "wine10"))).pack(pady=2)
+        if not ENGINES["arm64"].exists():
+            def get_native():
+                if why := arm64_missing():
+                    return messagebox.showinfo("Native engine", why[0].upper() + why[1:] + ".", parent=top)
+                if messagebox.askyesno("Native engine (preview)", "Wine built for Apple Silicon: Windows programs run "
+                                       "through FEX instead of Rosetta. Graphics are vkd3d-proton and DXVK only (no D3DMetal "
+                                       "or DXMT), so many games run slower than on wine10 for now. It uses Highball's signed "
+                                       "loader, and bottles can't move to it: make a new one.\n\nDownload it (~415 MB)?", parent=top):
+                    bg("Downloading the native engine (~415 MB)…", get_engine, "arm64")
+            tk.Button(bar, text="Get Native Engine…", width=16, command=guarded(get_native)).pack(pady=2)
         for label, fn in [("New Bottle…", do_new),
                           ("Run Program…", do_run),
                           ("Open C: Drive", lambda: (n := sel()) and drive_c(n)),
@@ -2196,7 +2320,7 @@ if __name__ == "__main__":
             "engine": lambda n, e=None: set_engine(n, e) if e else print(engine(n)),
             "winver": lambda n, v=None: print(winver(n, v)), "keys": lambda n, v=None: print(keys(n, v)),
             "store": store_cli, "get-engine": get_engine, "accept-d3dmetal": accept_d3dmetal,
-            "display": lambda n, m=None: print(display(n, m)), "steam-repair": lambda n: print(steam_repair(n)),
+            "display": lambda n, m=None: print(display(n, m)), "copy-games": lambda s, d: print("\n".join(copy_games(s, d))), "steam-repair": lambda n: print(steam_repair(n)),
             "game": lambda n, prog, k=None, v=None: print(set_game(n, prog, k, v)), "art-key": lambda k=None: print(art_key(k)),
             "graphics": lambda n, g=None: print(set_graphics(n, g) if g else graphics(n)),
             "sync": lambda n, m=None: print(sync_mode(n, m)),

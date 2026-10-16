@@ -1,6 +1,6 @@
 # Plan: a native Apple Silicon engine
 
-Status: draft, October 2026. Nothing here is built yet.
+Status: October 2026. Option A is built (`get-engine arm64`, opt-in preview); option B is not.
 
 ## Why
 
