@@ -46,6 +46,27 @@ The sidebar's Stores section (or `python3 portal.py store …`) lists everything
   installer (every part of it) and run it.
 - **itch.io**: paste a personal API key from itch.io's settings. Installs take the game's first Windows
   download, skipping demos.
+- **Amazon Games** (Prime Gaming): through [Nile](https://github.com/imLinguin/nile), Heroic's Amazon client,
+  downloaded on first use. Sign in on Amazon's page and paste the address you land on.
+
+Covers come from Steam for Steam games and for any game the [umu database](https://github.com/Open-Wine-Components/umu-database)
+matches to one on Steam (which also brings that game's compatibility verdict). For the rest, add a free
+[SteamGridDB](https://www.steamgriddb.com) key: `python3 portal.py art-key KEY`, or Cover Art… in a store view.
 
 Logins are kept in `~/Library/Application Support/WindowsPortal/stores` (readable only by you) and
 Epic's in `…/WindowsPortal/legendary`. Disconnect removes them.
+
+## Per-game settings and fixes
+
+- **Display**: `python3 portal.py display NAME retina` renders at the screen's full resolution (sharp, slower);
+  `compact` does too with smaller text; `standard` is Wine's default. Manage Bottles → Display….
+- **Game settings** (Game Settings… on a program, or `python3 portal.py game NAME PROGRAM SETTING VALUE`):
+  `graphics` picks a layer for one game; `mouse force` fixes games whose camera spins or that lose the pointer.
+  They key on the program's .exe, so they also apply when Steam or a launcher starts it (on wine10, a game's
+  graphics layer reaches Steam games only if Steam wasn't already running).
+- **Repair Steam** (`python3 portal.py steam-repair NAME`): stops everything in the bottle, clears Steam's web
+  cache, removes a steam.cfg that blocks its self-update, starts Steam and checks its window comes up.
+- **Force Quit** now also stops processes that outlive Wine's own shutdown, so nothing keeps running after a game.
+
+Display profiles, per-game mouse settings and Steam repair are adapted from
+[Mac Wine Launcher](https://github.com/MrBurge2000/mac-wine-launcher) (MIT).
