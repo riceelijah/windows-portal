@@ -1750,6 +1750,10 @@ def gui():
     state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None,
              "stores": {}, "store_fetched": set(), "art_asked": set()}  # filter ("store", key) shows that store's library
     images = {}  # Tk forgets images Python garbage-collects, so keep refs
+    prefs_file, played_file = DATA / "gui.json", DATA / "played.json"
+    prefs = json.loads(prefs_file.read_text()) if prefs_file.exists() else {}
+    played = json.loads(played_file.read_text()) if played_file.exists() else {}
+    state["cache"] = {}  # tile key -> (frame, item, paint): tiles are reused, never rebuilt per redraw
 
     def ui(fn, *a):
         jobs.put(lambda: fn(*a))
@@ -1830,12 +1834,39 @@ def gui():
     tk.Entry(top, textvariable=query, bg=CARD, fg=FG, insertbackground=FG, relief="flat", width=26,
              highlightthickness=1, highlightbackground=HOVER, highlightcolor=ACCENT).pack(side="right", ipady=5)
     tk.Label(top, text="Search", bg=BG, fg=DIM).pack(side="right", padx=8)
+    sort_by = tk.StringVar(value=prefs.get("sort", "Name A–Z"))
+    show_only = tk.StringVar(value="All")
+    sort_menu = tk.OptionMenu(top, sort_by, "Name A–Z")
+    show_menu = tk.OptionMenu(top, show_only, "All")
+    for m in (show_menu, sort_menu):
+        m.configure(bg=BG, highlightthickness=0, width=14)
+        m.pack(side="right", padx=4)
+    tk.Label(top, text="Sort", bg=BG, fg=DIM).pack(side="right", padx=(16, 0))
+
+    def set_options(menu, var, options):
+        m = menu["menu"]
+        m.delete(0, "end")
+        for o in options:
+            m.add_command(label=o, command=lambda o=o: var.set(o))
+        if var.get() not in options:
+            var.set(options[0])
+
+    def saved_sort(*_):
+        prefs["sort"] = sort_by.get()
+        try:
+            prefs_file.write_text(json.dumps(prefs))
+        except OSError:
+            pass
+        state.get("drawing") or draw()
+    sort_by.trace_add("write", saved_sort)
+    show_only.trace_add("write", lambda *_: state.get("drawing") or draw())
     detail = tk.Frame(main, bg=SIDE, height=120)
     detail.pack(side="bottom", fill="x")
     detail.pack_propagate(False)
-    canvas = tk.Canvas(main, bg=BG, highlightthickness=0)
+    canvas = tk.Canvas(main, bg=BG, highlightthickness=0, yscrollincrement=12)  # small steps: smooth scrolling sends many events
     canvas.pack(fill="both", expand=True, padx=(16, 8))
     grid = tk.Frame(canvas, bg=BG)
+    state["empty"] = tk.Label(grid, bg=BG, fg=DIM, font=("Helvetica", 14), pady=40)
     canvas.create_window(0, 0, window=grid, anchor="nw")
     grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>", lambda e: layout())
@@ -1847,7 +1878,11 @@ def gui():
         if inside(under, canvas):  # only scroll the grid, never dialogs or the sidebar
             canvas.yview_scroll(-e.delta, "units")
     canvas.bind_all("<MouseWheel>", wheel)
-    query.trace_add("write", lambda *_: draw())
+    def search_changed(*_):  # wait for a pause in typing instead of redrawing on every key
+        if state.get("search_job"):
+            root.after_cancel(state["search_job"])
+        state["search_job"] = root.after(150, draw)
+    query.trace_add("write", search_changed)
 
     # ---------- library ----------
     def refresh():
@@ -1921,28 +1956,65 @@ def gui():
                  ("Not installed" if g.get("windows", True) else "No Windows version"), ("store", store, gid, g), arts[gid])
                 for gid, g in ordered]
 
+    def key_of(item):
+        target = item[2]
+        return ("s", target[1], target[2]) if isinstance(target, tuple) else ("p", item[1], target)
+
+    def played_at(item):
+        return played.get("|".join(map(str, key_of(item)[1:])), 0)
+
     def draw():
-        for f, *_ in state["tiles"]:
-            f.destroy()
+        state["drawing"] = True  # set_options below may reset a menu; its trace must not redraw mid-draw
+        try:
+            _draw()
+        finally:
+            state["drawing"] = False
+
+    def _draw():
+        state["search_job"] = None
         q = query.get().lower()
         store = store_view()
         if store:
-            shown = [i for i in store_items(store) if q in str(i[0]).lower()]
+            items = store_items(store)
             heading.config(text=STORES[store])
+            set_options(show_menu, show_only, ["All", "Installed", "Not installed"])
+            set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Installed first"])
+            keep = {"Installed": lambda i: i[2][3].get("installed"), "Not installed": lambda i: not i[2][3].get("installed")}
         else:
-            shown = [i for i in state["items"] if state["filter"] in (None, i[1]) and q in i[0].lower()]
+            items = [i for i in state["items"] if state["filter"] in (None, i[1])]
             heading.config(text=state["filter"] or "All Programs")
+            engines = sorted({ENGINE_NAMES.get(engine(b), engine(b)) for b in {i[1] for i in items}})
+            set_options(show_menu, show_only, ["All", *engines])
+            set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Bottle"])
+            keep = {e: (lambda i, e=e: ENGINE_NAMES.get(engine(i[1]), engine(i[1])) == e) for e in engines}
+        shown = [i for i in items if q in str(i[0]).lower() and keep.get(show_only.get(), bool)(i)]
+        name = lambda i: str(i[0]).lower()
+        order = sort_by.get()
+        if order == "Name Z–A":
+            shown.sort(key=name, reverse=True)
+        elif order == "Recently played":
+            shown.sort(key=lambda i: (-played_at(i), name(i)))
+        elif order in ("Installed first", "Bottle"):
+            shown.sort(key=lambda i: (not i[2][3].get("installed"), name(i)) if store else (i[1].lower(), name(i)))
+        else:
+            shown.sort(key=name)
         state["tiles"] = [tile(i) for i in shown]
         if not shown:
-            text = ("No programs here yet.\nUse Install Software or Add Program on the left." if not store else
-                    "Install Steam in a bottle and sign in once:\nevery game you own shows up here." if store == "steam" else
-                    f"Connect your {STORES[store]} account below." if not store_connected(store) else "Loading your library…")
-            f = tk.Label(grid, bg=BG, fg=DIM, font=("Helvetica", 14), pady=40, text=text)
-            state["tiles"] = [(f, None, lambda c: None)]
+            state["empty"].config(text="Nothing matches the search or filter." if items else
+                                  "No programs here yet.\nUse Install Software or Add Program on the left." if not store else
+                                  "Install Steam in a bottle and sign in once:\nevery game you own shows up here." if store == "steam" else
+                                  f"Connect your {STORES[store]} account below." if not store_connected(store) else "Loading your library…")
         layout()
         show_detail()
 
     def tile(item):
+        """The item's tile, reused from earlier draws unless the item itself changed (e.g. its cover arrived)."""
+        k = key_of(item)
+        if k in state["cache"]:
+            f, old, paint = state["cache"][k]
+            if old == item:
+                return state["cache"][k]
+            f.destroy()
         title, b, target, icon = item
         f = tk.Frame(grid, bg=CARD, width=172, height=206)
         f.pack_propagate(False)
@@ -1970,21 +2042,37 @@ def gui():
         f.bind("<Enter>", lambda e: picked() or paint(HOVER))
         f.bind("<Leave>", leave)
         paint(SEL if picked() else CARD)
-        return f, item, paint
+        state["cache"][k] = (f, item, paint)
+        return state["cache"][k]
 
     def layout():
         cols = max(1, canvas.winfo_width() // 188)
+        visible = {str(f) for f, *_ in state["tiles"]}
+        for f, *_ in state["cache"].values():
+            if str(f) not in visible and f.winfo_manager():
+                f.grid_remove()
+        if state["tiles"]:
+            state["empty"].grid_remove()
+        else:
+            state["empty"].grid(row=0, column=0)
         for i, (f, *_) in enumerate(state["tiles"]):
             f.grid(row=i // cols, column=i % cols, padx=8, pady=8)
+        canvas.configure(scrollregion=canvas.bbox("all"))
 
     def select(item):
-        state["selected"] = item
+        old, state["selected"] = state["selected"], item
         for f, it, paint in state["tiles"]:
-            paint(SEL if it == item else CARD)
+            if it in (old, item):  # only the two tiles that change
+                paint(SEL if it == item else CARD)
         show_detail()
 
     def play(item):
         title, b, target, _ = item
+        played["|".join(map(str, key_of(item)[1:]))] = time.time()
+        try:
+            played_file.write_text(json.dumps(played))
+        except OSError:
+            pass
         if isinstance(target, tuple):  # a store game
             _, store, gid, g = target
             if not g.get("installed"):
