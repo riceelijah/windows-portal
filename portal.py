@@ -572,6 +572,12 @@ WEBHELPER = zlib.decompress(base64.b64decode(
     "Cvu6+ZVctuaK5hmdvFDUaKmuFOW3beMOfrOlerkbrj2mWNVmqxfvPtYvd79t+0N9LHsunMCweVSr3e2x0PP/4AUWqD+g=="))
 
 
+def steam_flags(name):
+    """Extra Steam switches per engine. On the native engine Steam's browser composites through d3d11 on vkd3d and
+    MoltenVK, which flashes the window black; software compositing doesn't. Only Steam's own window is affected."""
+    return ("-cef-disable-gpu-compositing",) if engine(name) == "arm64" else ()
+
+
 def steam_exe(name, target):
     """The bottle's steam.exe if target launches Steam (its shortcut or exe), else None."""
     exe = bottle(name) / "drive_c/Program Files (x86)/Steam/steam.exe"
@@ -603,7 +609,7 @@ def run(name, exe, *args, wait=True):
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
         fix_steam(name)
         # ...but not before Steam's first update: with the flag, a fresh install shows "Fatal Error" and stops
-        exe, args = str(steam), (("-noverifyfiles",) if (steam.parent / "steamui.dll").exists() else ()) + tuple(args)
+        exe, args = str(steam), (("-noverifyfiles",) if (steam.parent / "steamui.dll").exists() else ()) + steam_flags(name) + tuple(args)
     low = exe.lower()
     cmd = ([w, "msiexec", "/i", exe] if low.endswith(".msi") else
            [w, "start", "/unix", exe] if low.endswith(".lnk") else [w, exe])
@@ -1646,7 +1652,8 @@ def mac_app(name, target, title=None):
         w, d = shlex.quote(str(DATA / "steamwebhelper.exe")), shlex.quote(str(steam.parent / "bin/cef/cef.win64"))
         fix = f'cmp -s {w} {d}/steamwebhelper.exe || {{ mv -f {d}/steamwebhelper.exe {d}/steamwebhelper_real.exe && cp {w} {d}/steamwebhelper.exe; }}\n'
         ui_dll = shlex.quote(str(steam.parent / "steamui.dll"))  # checked at each launch: fresh installs need the update
-        launch = f"{shlex.quote(str(steam))} $([ -f {ui_dll} ] && echo -noverifyfiles)" + (f" -applaunch {appid}" if appid else "")
+        launch = (f"{shlex.quote(str(steam))} $([ -f {ui_dll} ] && echo -noverifyfiles) {' '.join(steam_flags(name))}" +
+                  (f" -applaunch {appid}" if appid else ""))
     if hit := launcher_app_of(name, target):  # via Legendary/Nile for the login token, so through this script
         me = shlex.quote(sys.executable) + ("" if FROZEN else " " + shlex.quote(str(Path(__file__).resolve())))
         script.write_text(f"#!/bin/sh\nexec {me} store play {hit[0]} {shlex.quote(hit[1])}\n")
