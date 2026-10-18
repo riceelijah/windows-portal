@@ -604,8 +604,7 @@ def run(name, exe, *args, wait=True):
         proc = (epic_launch if hit[0] == "epic" else amazon_launch)(name, hit[1], *args)
         return proc.wait() if wait else proc
     w, game = wine(name), exe
-    if not wine_pids(name) and exe_pids(name):  # outlived their wineserver (a hung Steam webhelper): stuck in the Dock
-        kill(name)
+    reap(name)
     if appid := steam_appid(name, exe):  # Steam games launch through Steam: it adds their launch options and DRM
         exe, args = "steam.exe", ("-applaunch", appid, *args)
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
@@ -646,6 +645,13 @@ def kill(name):
             except OSError:
                 pass
         time.sleep(wait)
+
+
+def reap(name):
+    """Kills Windows programs that outlived their bottle's wineserver (a hung Steam webhelper, a Steam whose wineserver
+    died): without it they can't run, and each sits in the Dock as a dead "wineloader"."""
+    if not wine_pids(name) and exe_pids(name):
+        kill(name)
 
 
 def bottle_pids(name):
@@ -1888,6 +1894,8 @@ def ui_info():
 
 def ui_library():
     """Bottles and every program in them (Steam sync first, so new Steam installs appear)."""
+    for b in bottles():  # the app refreshes when opened and when you come back to it: a good time to clear leftovers
+        reap(b)
     err = None
     try:
         sync_steam()
