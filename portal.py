@@ -604,6 +604,8 @@ def run(name, exe, *args, wait=True):
         proc = (epic_launch if hit[0] == "epic" else amazon_launch)(name, hit[1], *args)
         return proc.wait() if wait else proc
     w, game = wine(name), exe
+    if not wine_pids(name) and exe_pids(name):  # outlived their wineserver (a hung Steam webhelper): stuck in the Dock
+        kill(name)
     if appid := steam_appid(name, exe):  # Steam games launch through Steam: it adds their launch options and DRM
         exe, args = "steam.exe", ("-applaunch", appid, *args)
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
@@ -647,11 +649,34 @@ def kill(name):
 
 
 def bottle_pids(name):
-    """Processes started with this bottle's WINEPREFIX, from ps -E (the environment, readable for your own)."""
+    """This bottle's processes: the Wine side by WINEPREFIX, then its Windows programs."""
+    return sorted(set(wine_pids(name)) | set(exe_pids(name)))
+
+
+def wine_pids(name):
+    """Processes started with this bottle's WINEPREFIX, from ps -E (the environment, readable for your own). Mostly
+    the wineserver: Windows programs overwrite their argv, which hides the environment from ps."""
     tag = f"WINEPREFIX={bottle(name)}"
     out = subprocess.run(["ps", "-axwwE", "-o", "pid=,command="], capture_output=True, text=True).stdout
     return [int(line.split(None, 1)[0]) for line in out.splitlines()
             if re.search(re.escape(tag) + r"(\s|$)", line) and int(line.split(None, 1)[0]) != os.getpid()]
+
+
+def exe_pids(name):
+    """Windows programs of this bottle: an .exe command whose working directory is inside it."""
+    root = str(bottle(name)) + "/"
+    out = subprocess.run(["lsof", "-w", "-d", "cwd", "-Fpn"], capture_output=True, text=True).stdout
+    pids, pid = [], None
+    for line in out.splitlines():
+        if line[:1] == "p":
+            pid = int(line[1:])
+        elif line[:1] == "n" and line[1:].startswith(root):
+            pids.append(pid)
+    if not pids:
+        return []
+    out = subprocess.run(["ps", "-ww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                         capture_output=True, text=True).stdout
+    return [int(l.split(None, 1)[0]) for l in out.splitlines() if ".exe" in l.lower()]
 
 
 def steam_repair(name):
