@@ -1,6 +1,7 @@
 #!/bin/zsh
-# Builds a distributable "Windows Portal.app" on an Apple Silicon Mac: Python and Tk bundled by PyInstaller, plus the
-# signed Wine loader helper the native engine needs (helper/wineloader). See docs/signing.md for the one-time setup.
+# Builds a distributable "Windows Portal.app" on an Apple Silicon Mac: the SwiftUI window (ui/) over portal.py with its
+# Python bundled by PyInstaller, plus the signed Wine loader helper the native engine needs (helper/wineloader). See
+# docs/signing.md for the one-time setup.
 #
 # Settings (environment):
 #   WP_VERSION           version string (default 1.0)
@@ -22,15 +23,17 @@ APP="dist/Windows Portal.app"
 HELPER_BUILD=build/WineLoader.app
 mkdir -p build dist
 
-# 1. The app: PyInstaller, pinned, in its own virtualenv. Needs a python3 with Tk (python.org's, or Homebrew's
-#    python-tk), since PyInstaller bundles the Tk the interpreter has.
-python3 -c 'import tkinter' || { echo "error: this python3 has no Tk; install python.org's Python or brew install python-tk" >&2; exit 1; }
+# 1. The backend: portal.py and its Python, by PyInstaller (pinned, in its own virtualenv). Its executable keeps the
+#    name "Windows Portal": Mac apps made by `portal.py app` call it for store launches.
 [[ -x build/venv/bin/pyinstaller ]] || { python3 -m venv build/venv && build/venv/bin/pip install -q pyinstaller==6.11.1; }
 sips -s format icns -z 512 512 icon.png --out build/icon.icns >/dev/null
 rm -rf "$APP"
 build/venv/bin/pyinstaller --noconfirm --clean --windowed --name "Windows Portal" \
   --icon "$PWD/build/icon.icns" --osx-bundle-identifier "$BUNDLE_ID" --add-data "$PWD/icon.png:." \
   --distpath dist --workpath build/pyinstaller --specpath build portal.py >/dev/null
+# The window: SwiftUI, the bundle's main executable. It starts the backend next to it (ui/Backend.swift).
+swiftc -O -parse-as-library -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/WindowsPortal" ui/*.swift
+plutil -replace CFBundleExecutable -string WindowsPortal "$APP/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"
 plutil -replace LSApplicationCategoryType -string public.app-category.games "$APP/Contents/Info.plist"

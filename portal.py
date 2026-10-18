@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Windows Portal: a free CrossOver-style bottle manager on top of Wine.
 
-  python3 portal.py                        # GUI
+  python3 portal.py                        # the app (builds it from ui/ on first run)
   python3 portal.py setup                  # install Wine (Game Porting Toolkit) + winetricks
   python3 portal.py package [DIR]          # build "Windows Portal.app" (default ~/Applications)
   python3 portal.py new NAME [WINVER] [ENGINE]  # WINVER: win10 (default), win11, win7, winxp64...
@@ -1849,17 +1849,12 @@ def package(dest=Path.home() / "Applications"):
     shutil.copy(Path(__file__).with_name("icon.png"), app / "Contents/Resources/icon.png")  # library's fallback icon
     subprocess.run(["sips", "-s", "format", "icns", "-z", "512", "512", str(Path(__file__).with_name("icon.png")),
                     "--out", str(app / "Contents/Resources/icon.icns")], check=True, capture_output=True)
-    # ponytail: pins this machine's Python (needs 3.11.4+ with Tk); bundle Python with PyInstaller to share the app.
-    # Finder-launched apps get a bare PATH, so add Homebrew's for wine64/winetricks/brew.
-    launch = app / "Contents/MacOS/launch"
-    # Run Python through a link inside the bundle: macOS then registers the process as this app, not as
-    # a bare python3, which is what gives Tk proper activation, focus and first-click handling.
+    # ponytail: pins this machine's Python (3.11.4+); bundle Python with PyInstaller (scripts/build-app.sh) to share the app.
     os.symlink(sys.executable, app / "Contents/MacOS/python")  # not realpath: python3 keeps working across 3.x upgrades
-    launch.write_text(f'#!/bin/sh\nexport PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
-                      f'exec "$(dirname "$0")/python" "$(dirname "$0")/../Resources/portal.py" gui\n')
-    launch.chmod(0o755)
+    ui = sorted(Path(__file__).resolve().with_name("ui").glob("*.swift"))
+    subprocess.run(["swiftc", "-O", "-parse-as-library", "-o", str(app / "Contents/MacOS/WindowsPortal"), *map(str, ui)], check=True)
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
-        "CFBundleExecutable": "launch", "CFBundleName": "Windows Portal", "CFBundleDisplayName": "Windows Portal",
+        "CFBundleExecutable": "WindowsPortal", "CFBundleName": "Windows Portal", "CFBundleDisplayName": "Windows Portal",
         "CFBundleIdentifier": "local.windowsportal", "CFBundlePackageType": "APPL", "CFBundleIconFile": "icon",
         "CFBundleShortVersionString": "1.0", "NSHighResolutionCapable": True}))
     print(app)
@@ -1869,766 +1864,156 @@ def drive_c(name):
     subprocess.run(["open", bottle(name) / "drive_c"])
 
 
-def gui():
-    import queue, threading, tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog
+# ---------- the app's backend: the SwiftUI window (ui/) talks to this over stdin/stdout ----------
+PLAYED = DATA / "played.json"
+_art_slots = threading.BoundedSemaphore(4)  # covers load as tiles scroll into view; don't open 50 downloads at once
 
-    BG, SIDE, CARD, HOVER, SEL, FG, DIM, ACCENT = ("#18181c", "#111114", "#222228", "#2e2e37", "#3b3170",
-                                                   "#ececf0", "#8e8e98", "#7a5cff")
-    root = tk.Tk()
-    root.title("Windows Portal")
-    root.geometry("1120x720")
-    root.minsize(640, 420)
-    root.configure(bg=BG)
-    status = tk.StringVar()
-    jobs = queue.Queue()  # worker threads never touch Tk; they post callables here
-    state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None,
-             "stores": {}, "store_fetched": set(), "art_asked": set()}  # filter ("store", key) shows that store's library
-    images = {}  # Tk forgets images Python garbage-collects, so keep refs
-    prefs_file, played_file = DATA / "gui.json", DATA / "played.json"
-    prefs = json.loads(prefs_file.read_text()) if prefs_file.exists() else {}
-    played = json.loads(played_file.read_text()) if played_file.exists() else {}
-    state["cache"] = {}  # tile key -> (frame, item, paint): tiles are reused, never rebuilt per redraw
 
-    def ui(fn, *a):
-        jobs.put(lambda: fn(*a))
+def played():
+    return json.loads(PLAYED.read_text()) if PLAYED.exists() else {}
 
-    def poll():
-        while not jobs.empty():
-            jobs.get()()
-        root.after(100, poll)
 
-    def bg(msg, fn, *a):
-        status.set(msg)
+def mark_played(key):
+    PLAYED.parent.mkdir(parents=True, exist_ok=True)
+    PLAYED.write_text(json.dumps({**played(), key: time.time()}))
 
-        def work():
-            try:
-                fn(*a)
-                ui(finished, None)
-            except (SystemExit, Exception) as e:
-                ui(finished, str(e))
-        threading.Thread(target=work, daemon=True).start()
 
-    def finished(err):
-        status.set("")
-        if err:
-            messagebox.showerror("Windows Portal", err)
-        refresh()
+def ui_info():
+    """What the window needs once: engines, stores, the installer catalog, licenses."""
+    return {"engines": {k: {"name": ENGINE_NAMES[k], "installed": p.exists(), "graphics": GRAPHICS[k]} for k, p in ENGINES.items()},
+            "stores": STORES, "renderers": RENDERERS, "catalog": list(catalog()), "archives": ARCHIVES,
+            "d3dmetal_accepted": bool(d3dmetal_accepted()), "d3dmetal_license": D3DMETAL_LICENSE,
+            "arm64_missing": arm64_missing(), "art_key": art_key()}
 
-    def guarded(fn):
-        def f(*_):
-            try:
-                fn()
-            except SystemExit as e:
-                messagebox.showerror("Windows Portal", str(e))
-        return f
 
-    def button(parent, text, fn, accent=False, color=None):
-        # Labels, not Buttons: macOS Aqua buttons ignore colors.
-        c = color or (ACCENT if accent else HOVER)
-        b = tk.Label(parent, text=text, bg=c, fg="white", padx=16, pady=7,
-                     font=("Helvetica", 13, "bold" if accent else "normal"))
-        b.bind("<Button-1>", guarded(fn))
-        return b
+def ui_library():
+    """Bottles and every program in them (Steam sync first, so new Steam installs appear)."""
+    err = None
+    try:
+        sync_steam()
+    except (SystemExit, Exception) as e:
+        err = f"Steam games: {e}"
+    try:
+        mac = {a for a, g in store_list("steam").items() if g.get("mac")}
+    except (SystemExit, Exception):
+        mac = set()
+    seen = played()
+    items = []
+    for b in bottles():
+        for t, p in programs(b).items():
+            appid = steam_appid_of(b, t)
+            items.append({"title": t, "bottle": b, "target": p, "icon": icon_png(b, p, 128), "appid": appid,
+                          "mac": appid in mac, "played": seen.get(f"{b}|{p}", 0)})
+    return {"bottles": [{"name": b, "engine": engine(b), "graphics": graphics(b)} for b in bottles()],
+            "items": items, "error": err}
 
-    def photo(path):
-        if path not in images:
-            images[path] = tk.PhotoImage(file=path)
-        return images[path]
 
-    def pick_bottle():
-        bs = bottles()
-        if isinstance(state["filter"], str):  # a bottle is selected in the sidebar (not a store)
-            return state["filter"]
-        if not bs:
-            messagebox.showinfo("Windows Portal", "Create a bottle first (Manage Bottles → New Bottle).")
-            return None
-        if len(bs) == 1:
-            return bs[0]
-        n = simpledialog.askstring("Which bottle?", "Bottles: " + ", ".join(bs), initialvalue=bs[0])
-        return n if n in bs else None
+def ui_store(store, refresh=False):
+    """A store's library; refresh=False answers from the cached list at once."""
+    seen = played()
+    games = store_list(store, refresh=refresh)
+    return {"connected": store_connected(store),
+            "games": [{**g, "id": gid, "art": cover_art(store, gid, g["title"], fetch=False),
+                       "played": seen.get(f"{store}|{gid}", 0)} for gid, g in games.items()]}
 
-    # ---------- layout ----------
-    side = tk.Frame(root, bg=SIDE, width=220)
-    side.pack(side="left", fill="y")
-    side.pack_propagate(False)
-    tk.Label(side, text="Windows Portal", bg=SIDE, fg=FG, font=("Helvetica", 18, "bold")).pack(anchor="w", padx=18, pady=(20, 16))
-    nav = tk.Frame(side, bg=SIDE)
-    nav.pack(fill="x")
-    acts = tk.Frame(side, bg=SIDE)
-    acts.pack(side="bottom", fill="x", padx=14, pady=14)
-    tk.Label(side, textvariable=status, bg=SIDE, fg=DIM, wraplength=190, justify="left").pack(side="bottom", anchor="w", padx=18)
 
-    main = tk.Frame(root, bg=BG)
-    main.pack(side="left", fill="both", expand=True)
-    top = tk.Frame(main, bg=BG)
-    top.pack(fill="x", padx=24, pady=(20, 10))
-    heading = tk.Label(top, bg=BG, fg=FG, font=("Helvetica", 24, "bold"))
-    heading.pack(side="left")
-    query = tk.StringVar()
-    tk.Entry(top, textvariable=query, bg=CARD, fg=FG, insertbackground=FG, relief="flat", width=26,
-             highlightthickness=1, highlightbackground=HOVER, highlightcolor=ACCENT).pack(side="right", ipady=5)
-    tk.Label(top, text="Search", bg=BG, fg=DIM).pack(side="right", padx=8)
-    sort_by = tk.StringVar(value=prefs.get("sort", "Name A–Z"))
-    sort_menu = tk.OptionMenu(top, sort_by, "Name A–Z")
-    # Filters are checkboxes that stack: within a group a game passes if any ticked box fits it (Installed or Not
-    # installed), across groups it must pass each group (has a Mac version AND not installed).
-    filter_button = tk.Menubutton(top, text="Filters", bg=BG, relief="raised", width=12)
-    filter_menu = tk.Menu(filter_button, tearoff=False)
-    filter_button["menu"] = filter_menu
-    filters = {}  # label -> BooleanVar, kept across views so a tick survives switching back
-    for m in (filter_button, sort_menu):
-        m.configure(highlightthickness=0)
-        m.pack(side="right", padx=4)
-    sort_menu.configure(bg=BG, width=14)
-    tk.Label(top, text="Sort", bg=BG, fg=DIM).pack(side="right", padx=(16, 0))
+def ui_art(store, gid, title):
+    with _art_slots:
+        return cover_art(store, gid, title)
 
-    def set_options(menu, var, options):
-        m = menu["menu"]
-        m.delete(0, "end")
-        for o in options:
-            m.add_command(label=o, command=lambda o=o: var.set(o))
-        if var.get() not in options:
-            var.set(options[0])
 
-    def saved_sort(*_):
-        prefs["sort"] = sort_by.get()
+def ui_art_key(key):
+    art_key(key)
+    for f in (CACHE / "art").glob("*.none"):  # ask again for the ones that had none
+        f.unlink()
+
+
+def ui_detail(name, target, title):
+    eng = engine(name)
+    files = target if not target.lower().endswith(".lnk") else str(win_to_mac(name, lnk_target(target) or "C:\\"))
+    return {"engine": ENGINE_NAMES[eng], "graphics": graphics(name), "graphics_name": RENDERERS.get(graphics(name), graphics(name)),
+            "options": GRAPHICS[eng], "own": set_game(name, target), "added": title in library().get(name, {}), "files": files}
+
+
+def ui_compat(appid, name=None):
+    """Highball's verdict for a Steam app id, with a hint when the bottle could use its best renderer."""
+    d = compat(appid)
+    best = (d.get("game") or {}).get("renderer")
+    hint = (" (Graphics… to switch)" if name and best in GRAPHICS[engine(name)] and best != graphics(name) else
+            " (not on the native engine)" if name and engine(name) == "arm64" and best in ("d3dmetal", "dxmt") else "")
+    return {"verdict": (compat_verdict(d) or "Not in the compatibility database") + hint, "blocked": compat_blocked(d),
+            "url": d.get("url", "https://gethighball.com/database/")}
+
+
+def ui_play(name, target, title, force=False):
+    """Launches a library program; first returns {"blocked": verdict} if Highball says it can't run."""
+    appid = steam_appid_of(name, title)
+    if not force and appid and compat_blocked(d := compat(appid, cached_only=True)):
+        return {"blocked": compat_verdict(d)}
+    mark_played(f"{name}|{target}")
+    run(name, target, wait=False)
+    return {}
+
+
+def ui_store_play(store, gid):
+    mark_played(f"{store}|{gid}")
+    store_play(store, gid)
+
+
+def ui_bottle(name):
+    """A bottle's settings for Manage Bottles, from its config (instant)."""
+    eng = engine(name)
+    return {"engine": eng, "graphics": graphics(name), "options": GRAPHICS[eng], "display": display(name),
+            "sync": sync_mode(name) if eng == "wine10" else None}
+
+
+def ui_bottle_wine(name):
+    """The settings only Wine's registry knows; starting the bottle's wineserver can take ~10 s."""
+    return {"keys": keys(name), "winver": winver(name)}
+
+
+def serve():
+    """JSON lines on stdin: {"id", "call", "args", "kw"}; answers {"id", "ok"} or {"id", "error"} on stdout. Each
+    call runs on its own thread, so a slow one (an install, a download) never holds up the rest."""
+    out, requests = os.fdopen(os.dup(1), "w"), os.fdopen(os.dup(0))
+    os.dup2(2, 1)  # print() and child processes go to stderr, never into the replies
+    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)  # and never read the requests: Wine's console reads its stdin
+    lock = threading.Lock()
+    api = {f.__name__: f for f in (
+        ui_info, ui_library, ui_store, ui_art, ui_art_key, ui_detail, ui_compat, ui_play, ui_store_play, ui_bottle, ui_bottle_wine,
+        umu_appid, store_install, store_mac, store_login_start, store_login, store_logout, set_game, accept_d3dmetal,
+        install, install_file, add_program, remove_program, mac_app, run, kill, new, winver, keys, set_graphics,
+        sync_mode, display, set_engine, drive_c, steam_repair, export, import_, delete, get_engine, tricks)}
+
+    def handle(req):
         try:
-            prefs_file.write_text(json.dumps(prefs))
-        except OSError:
-            pass
-        state.get("drawing") or draw()
-    sort_by.trace_add("write", saved_sort)
-
-    def set_filters(groups):
-        """groups: [[(label, predicate), ...], ...]; rebuilds the menu and returns the stacked predicate."""
-        filter_menu.delete(0, "end")
-        for gi, opts in enumerate(groups):
-            if gi:
-                filter_menu.add_separator()
-            for label, _ in opts:
-                filter_menu.add_checkbutton(label=label, variable=filters.setdefault(label, tk.BooleanVar(value=False)),
-                                            command=lambda: state.get("drawing") or draw())
-        on = [[p for label, p in opts if filters[label].get()] for opts in groups]
-        n = sum(map(len, on))
-        filter_button.config(text=f"Filters ({n})" if n else "Filters")
-        return lambda i: all(any(p(i) for p in ps) for ps in on if ps)
-    detail = tk.Frame(main, bg=SIDE, height=120)
-    detail.pack(side="bottom", fill="x")
-    detail.pack_propagate(False)
-    canvas = tk.Canvas(main, bg=BG, highlightthickness=0, yscrollincrement=12)  # small steps: smooth scrolling sends many events
-    canvas.pack(fill="both", expand=True, padx=(16, 8))
-    grid = tk.Frame(canvas, bg=BG)
-    state["empty"] = tk.Label(grid, bg=BG, fg=DIM, font=("Helvetica", 14), pady=40)
-    canvas.create_window(0, 0, window=grid, anchor="nw")
-    grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind("<Configure>", lambda e: layout())
-    def inside(w, parent):  # is widget w parent itself or one of its descendants?
-        return w is not None and (str(w) == str(parent) or str(w).startswith(f"{parent}."))
-
-    def wheel(e):
-        under = root.winfo_containing(e.x_root, e.y_root)
-        if inside(under, canvas):  # only scroll the grid, never dialogs or the sidebar
-            canvas.yview_scroll(-e.delta, "units")
-    canvas.bind_all("<MouseWheel>", wheel)
-    def search_changed(*_):  # wait for a pause in typing instead of redrawing on every key
-        if state.get("search_job"):
-            root.after_cancel(state["search_job"])
-        state["search_job"] = root.after(150, draw)
-    query.trace_add("write", search_changed)
-
-    # ---------- library ----------
-    def refresh(store=None):
-        """Re-reads bottles and the library (running Steam sync, so new Steam installs appear); store refetches that
-        store's list too."""
-        if store:
-            state["store_fetched"].discard(store)
-        state["last_refresh"] = time.time()
-        draw_nav()
-        if state["manager"]:
-            state["manager"]()
-        status.set("Loading library…")
-
-        def work():  # Steam sync and icon extraction can take a moment, keep them off the UI thread
-            try:
-                if sync_steam():
-                    ui(draw_nav)  # the Steam games bottle may be new
-            except (SystemExit, Exception) as e:
-                ui(status.set, f"Steam games: {e}")
-            items = [(t, b, p, icon_png(b, p, 128)) for b in bottles() for t, p in programs(b).items()]
-            try:
-                state["steam_mac"] = {a for a, g in store_list("steam").items() if g.get("mac")}
-            except (SystemExit, Exception):
-                pass
-            ui(loaded, items)
-        threading.Thread(target=work, daemon=True).start()
-
-    def loaded(items):
-        state["items"] = items
-        if status.get().startswith("Loading"):  # keep a Steam sync error visible
-            status.set("")
-        draw()
-
-    def draw_nav():
-        for w in nav.winfo_children():
-            w.destroy()
-        rows = [(None, "All Programs")] + ([("", "BOTTLES")] if bottles() else []) + [(b, b) for b in bottles()] + \
-               [("", "STORES")] + [(("store", k), v) for k, v in STORES.items()]
-        for key, text in rows:
-            if key == "":
-                tk.Label(nav, text=text, bg=SIDE, fg=DIM, font=("Helvetica", 10, "bold")).pack(anchor="w", padx=18, pady=(14, 4))
-                continue
-            on = key == state["filter"]
-            l = tk.Label(nav, text=text, anchor="w", bg=HOVER if on else SIDE, fg=FG if on else DIM,
-                         padx=18, pady=7, font=("Helvetica", 13))
-            l.pack(fill="x")
-            l.bind("<Button-1>", lambda e, k=key: (state.update(filter=k, selected=None), draw_nav(), draw()))
-
-    def store_view():
-        f = state["filter"]
-        return f[1] if isinstance(f, tuple) else None
-
-    def store_items(store):
-        """Tiles for a store's library: (title, status, ("store", store, id, info), icon)."""
-        if store not in state["store_fetched"]:  # cached list now, the store's current one when it arrives
-            state["store_fetched"].add(store)
-            state["stores"][store] = store_list(store, refresh=False)
-
-            def work():
-                try:
-                    games = store_list(store)
-                    ui(lambda: (state["stores"].__setitem__(store, games), store_view() == store and draw()))
-                except (SystemExit, Exception) as e:
-                    ui(status.set, f"{STORES[store]}: {e}")
-            threading.Thread(target=work, daemon=True).start()
-        games = state["stores"].get(store) or {}
-        ordered = sorted(games.items(), key=lambda i: (not i[1].get("installed"), str(i[1]["title"]).lower()))
-        arts = {gid: cover_art(store, gid, g["title"], fetch=False) for gid, g in ordered}
-        missing = [(gid, g["title"]) for gid, g in ordered if not arts[gid] and (store, gid) not in state["art_asked"]]
-        if missing:  # one worker fetches covers in order and redraws now and then, so the grid fills in as they arrive
-            state["art_asked"].update((store, gid) for gid, _ in missing)
-
-            def fetch_art():
-                for i, (gid, title) in enumerate(missing, 1):
-                    got = cover_art(store, gid, title)
-                    if got and (i % 8 == 0 or i == len(missing)):
-                        ui(lambda: store_view() == store and draw())
-            threading.Thread(target=fetch_art, daemon=True).start()
-        def status_of(g):
-            win = (f"Installed in {g['installed']}" if g.get("installed") else
-                   "Not installed" if g.get("windows", True) else "No Windows version")
-            return ("Mac · installed" if g.get("mac_installed") else f"Mac version · {win}") if g.get("mac") else win
-        return [(g["title"], status_of(g), ("store", store, gid, g), arts[gid]) for gid, g in ordered]
-
-    def key_of(item):
-        target = item[2]
-        return ("s", target[1], target[2]) if isinstance(target, tuple) else ("p", item[1], target)
-
-    def played_at(item):
-        return played.get("|".join(map(str, key_of(item)[1:])), 0)
-
-    def draw():
-        state["drawing"] = True  # set_options below may reset a menu; its trace must not redraw mid-draw
-        try:
-            _draw()
-        finally:
-            state["drawing"] = False
-
-    def _draw():
-        state["search_job"] = None
-        q = query.get().lower()
-        store = store_view()
-        if store:
-            items = store_items(store)
-            heading.config(text=STORES[store])
-            set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Installed first"])
-            have = lambda i: i[2][3].get("installed") or i[2][3].get("mac_installed")
-            keep = set_filters([[("Has Mac version", lambda i: i[2][3].get("mac")),
-                                 ("No Mac version", lambda i: not i[2][3].get("mac"))],
-                                [("Installed", have), ("Not installed", lambda i: not have(i))]])
-        else:
-            items = [i for i in state["items"] if state["filter"] in (None, i[1])]
-            heading.config(text=state["filter"] or "All Programs")
-            engines = sorted({ENGINE_NAMES.get(engine(b), engine(b)) for b in {i[1] for i in items}})
-            set_options(sort_menu, sort_by, ["Name A–Z", "Name Z–A", "Recently played", "Bottle"])
-            mac = state.get("steam_mac", set())
-            has_mac = lambda i: steam_appid_of(i[1], i[0]) in mac
-            keep = set_filters([[(e, lambda i, e=e: ENGINE_NAMES.get(engine(i[1]), engine(i[1])) == e) for e in engines],
-                                [("Has Mac version", has_mac), ("No Mac version", lambda i: not has_mac(i))]])
-        shown = [i for i in items if q in str(i[0]).lower() and keep(i)]
-        name = lambda i: str(i[0]).lower()
-        order = sort_by.get()
-        if order == "Name Z–A":
-            shown.sort(key=name, reverse=True)
-        elif order == "Recently played":
-            shown.sort(key=lambda i: (-played_at(i), name(i)))
-        elif order in ("Installed first", "Bottle"):
-            shown.sort(key=lambda i: (not i[2][3].get("installed"), name(i)) if store else (i[1].lower(), name(i)))
-        else:
-            shown.sort(key=name)
-        state["tiles"] = [tile(i) for i in shown]
-        if not shown:
-            state["empty"].config(text="Nothing matches the search or filter." if items else
-                                  "No programs here yet.\nUse Install Software or Add Program on the left." if not store else
-                                  "Install Steam in a bottle and sign in once:\nevery game you own shows up here." if store == "steam" else
-                                  f"Connect your {STORES[store]} account below." if not store_connected(store) else "Loading your library…")
-        layout()
-        show_detail()
-
-    def tile(item):
-        """The item's tile, reused from earlier draws unless the item itself changed (e.g. its cover arrived)."""
-        k = key_of(item)
-        if k in state["cache"]:
-            f, old, paint = state["cache"][k]
-            if old == item:
-                return state["cache"][k]
-            f.destroy()
-        title, b, target, icon = item
-        f = tk.Frame(grid, bg=CARD, width=172, height=206)
-        f.pack_propagate(False)
-        fallback = Path(__file__).with_name("icon.png")
-        img = icon or (fallback if fallback.exists() else None)
-        if img:
-            pi = photo(str(img))
-            if pi.width() > 128:  # the 1024px app icon
-                pi = images.setdefault(f"{img}-small", pi.subsample(pi.width() // 128))
-            tk.Label(f, image=pi, bg=CARD).pack(pady=(20, 10))
-        tk.Label(f, text=title, bg=CARD, fg=FG, wraplength=150, font=("Helvetica", 12, "bold")).pack()
-        tk.Label(f, text=b, bg=CARD, fg=DIM, font=("Helvetica", 10)).pack()
-
-        def paint(c):
-            for w in (f, *f.winfo_children()):
-                w.config(bg=c)
-        picked = lambda: state["selected"] == item
-        for w in (f, *f.winfo_children()):
-            w.bind("<Button-1>", lambda e: select(item))
-            w.bind("<Double-Button-1>", lambda e: play(item))
-        def leave(e):  # moving onto the tile's own labels also fires <Leave>; only un-hover when truly outside
-            under = f.winfo_containing(e.x_root, e.y_root)
-            if not inside(under, f):
-                paint(SEL if picked() else CARD)
-        f.bind("<Enter>", lambda e: picked() or paint(HOVER))
-        f.bind("<Leave>", leave)
-        paint(SEL if picked() else CARD)
-        state["cache"][k] = (f, item, paint)
-        return state["cache"][k]
-
-    def layout():
-        cols = max(1, canvas.winfo_width() // 188)
-        visible = {str(f) for f, *_ in state["tiles"]}
-        for f, *_ in state["cache"].values():
-            if str(f) not in visible and f.winfo_manager():
-                f.grid_remove()
-        if state["tiles"]:
-            state["empty"].grid_remove()
-        else:
-            state["empty"].grid(row=0, column=0)
-        for i, (f, *_) in enumerate(state["tiles"]):
-            f.grid(row=i // cols, column=i % cols, padx=8, pady=8)
-        canvas.configure(scrollregion=canvas.bbox("all"))
-
-    def select(item):
-        old, state["selected"] = state["selected"], item
-        for f, it, paint in state["tiles"]:
-            if it in (old, item):  # only the two tiles that change
-                paint(SEL if it == item else CARD)
-        show_detail()
-
-    def play(item):
-        title, b, target, _ = item
-        played["|".join(map(str, key_of(item)[1:]))] = time.time()
-        try:
-            played_file.write_text(json.dumps(played))
-        except OSError:
-            pass
-        if isinstance(target, tuple):  # a store game
-            _, store, gid, g = target
-            if g.get("mac") and (g.get("mac_installed") or not g.get("installed")):  # native beats Wine
-                return get_mac(item)
-            if not g.get("installed"):
-                return install_store_game(item)
-            bg(f"Starting {title}…", store_play, store, gid)
-            return
-        appid = steam_appid_of(b, title)
-        if appid and compat_blocked(compat(appid, cached_only=True)) and not messagebox.askyesno(
-                "Windows Portal", f"Highball's database says {title} won't run under Wine on a Mac: "
-                f"{compat_verdict(compat(appid, cached_only=True))}.\n\nLaunch anyway?"):
-            return
-        run(b, target, wait=False)
-        status.set(f"Launched {title}")
-        root.after(4000, lambda: status.get() == f"Launched {title}" and status.set(""))
-
-    def run_windows(item):  # the store game's Windows version, even when a Mac one exists
-        title, _, (_, store, gid, g), _ = item
-        bg(f"Starting {title}…", store_play, store, gid)
-
-    def get_mac(item):
-        title, _, (_, store, gid, g), _ = item
-
-        def work():
-            msg = store_mac(store, gid)
-            ui(status.set, "")
-            ui(messagebox.showinfo, "Windows Portal", msg)
-        status.set(f"{title}: Mac version…")
-        state["store_fetched"].discard(store)  # pick up mac_installed afterwards
-
-        def run_it():
-            try:
-                work()
-            except (SystemExit, Exception) as e:
-                ui(messagebox.showerror, "Windows Portal", str(e))
-            ui(draw)
-        threading.Thread(target=run_it, daemon=True).start()
-
-    def install_store_game(item):
-        title, _, (_, store, gid, g), _ = item
-        if store == "steam":  # Steam downloads it in the bottle it's owned in
-            bg(f"Opening Steam to install {title}…", store_install, store, gid, g["bottle"])
-            return
-        n = pick_bottle()
-        if n:
-            bg(f"Installing {title} into {n}… (large games take a while)", store_install, store, gid, n)
-
-    def connect_store(store):
-        try:
-            how = store_login_start(store)  # opens the sign-in page
+            reply = {"id": req["id"], "ok": api[req["call"]](*req.get("args", []), **req.get("kw", {}))}
         except SystemExit as e:
-            return messagebox.showerror("Windows Portal", str(e))
-        code = simpledialog.askstring(f"Connect {STORES[store]}", f"{how}\n\nPaste it here:")
-        if code:
-            state["store_fetched"].discard(store)
-            bg(f"Connecting {STORES[store]}…", store_login, store, code)
+            reply = {"id": req["id"], "error": str(e.code or "failed")}
+        except Exception as e:
+            reply = {"id": req["id"], "error": f"{type(e).__name__}: {e}"}
+        line = json.dumps(reply, default=lambda o: str(o) if isinstance(o, Path) else None)
+        with lock:
+            out.write(line + "\n")
+            out.flush()
+    for line in requests:  # closes when the app quits; calls still running (an install) finish first
+        threading.Thread(target=handle, args=(json.loads(line),)).start()
 
-    def store_detail(store):
-        bar = tk.Frame(detail, bg=SIDE)
-        bar.pack(side="right", padx=24)
-        if store == "steam":
-            tk.Label(detail, text="Your Steam library comes from the Steam you're signed in to in a bottle.",
-                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
-        elif not store_connected(store):
-            tk.Label(detail, text=f"Not connected. Sign in once; Windows Portal keeps the login on this Mac.",
-                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
-            button(bar, f"Connect {STORES[store]}…", lambda: connect_store(store), True).pack(side="left", padx=4)
-            return
-        else:
-            tk.Label(detail, text="Select a game. Double-click to install or play.",
-                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(side="left", padx=24)
-            button(bar, "Disconnect", lambda: messagebox.askyesno("Windows Portal", f"Disconnect {STORES[store]}?")
-                   and (store_logout(store), state["stores"].pop(store, None), draw())).pack(side="left", padx=4)
-        button(bar, "Refresh", lambda: refresh(store)).pack(side="left", padx=4)
-        if store != "steam":
-            button(bar, "Cover Art…", set_art_key).pack(side="left", padx=4)
 
-    def set_art_key():
-        k = simpledialog.askstring("Cover art", "Games also on Steam get Steam's covers. For the rest, paste a free "
-                                   f"SteamGridDB API key (steamgriddb.com → Preferences → API).\n\nNow: {art_key()}")
-        if k:
-            art_key(k)
-            for f in (CACHE / "art").glob("*.none"):  # ask again for the ones that had none
-                f.unlink()
-            state["art_asked"].clear()
-            draw()
-
-    def verdict_label(parent, appid, b=None):
-        """Highball's verdict for a Steam app id, fetched off the UI thread; click opens its page."""
-        verdict = tk.Label(parent, text="Checking compatibility…", bg=SIDE, fg=DIM, cursor="hand2")
-        verdict.pack(anchor="w")
-
-        def shown(d):
-            if verdict.winfo_exists():
-                best = (d.get("game") or {}).get("renderer")
-                hint = (f" (Graphics… to switch)" if b and best in GRAPHICS[engine(b)] and best != graphics(b) else
-                        " (not on the native engine)" if b and engine(b) == "arm64" and best in ("d3dmetal", "dxmt") else "")
-                verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}{hint}  ↗",
-                               fg="#ff6b6b" if compat_blocked(d) else DIM)
-                verdict.bind("<Button-1>", lambda e: subprocess.run(["open", d.get("url", "https://gethighball.com/database/")]))
-        threading.Thread(target=lambda: ui(shown, compat(appid)), daemon=True).start()
-
-    def game_settings_dialog(b, target, title):
-        now = set_game(b, target)
-        opts = GRAPHICS[engine(b)]
-        g = simpledialog.askstring(f"{title}: graphics", f"Graphics for this game only (bottle: {graphics(b)}).\n"
-                                   f"{', '.join(opts)}, or default for the bottle's.", initialvalue=now.get("graphics", "default"))
-        if g is None:
-            return
-        if g == "d3dmetal" and engine(b) == "wine10" and not d3dmetal_accepted():
-            if not messagebox.askyesno("D3DMetal license", D3DMETAL_LICENSE + "\n\nAccept?"):
-                return
-            accept_d3dmetal(ask=False)
-        m = simpledialog.askstring(f"{title}: mouse", "Mouse: default, or force for games whose camera spins or that "
-                                   "lose the pointer (enable, disable also work).", initialvalue=now.get("mouse", "default"))
-        if m is None:
-            return
-
-        def apply():
-            set_game(b, target, "graphics", g.strip())
-            set_game(b, target, "mouse", m.strip())
-        bg(f"Saving settings for {title}…", apply)
-
-    def show_detail():
-        for w in detail.winfo_children():
-            w.destroy()
-        shown = [t[1] for t in state["tiles"]]
-        item = state["selected"] if state["selected"] in shown else None
-        if not item and store_view():
-            return store_detail(store_view())
-        if not item:
-            tk.Label(detail, text="Select a program to see its options. Double-click to play.",
-                     bg=SIDE, fg=DIM, font=("Helvetica", 13)).pack(padx=24, pady=44, anchor="w")
-            return
-        title, b, target, _ = item
-        info = tk.Frame(detail, bg=SIDE)
-        info.pack(side="left", padx=24)
-        tk.Label(info, text=title, bg=SIDE, fg=FG, font=("Helvetica", 20, "bold")).pack(anchor="w")
-        if isinstance(target, tuple):  # a store game
-            _, store, gid, g = target
-            tk.Label(info, text=f"{STORES[store]}  ·  {b}", bg=SIDE, fg=DIM).pack(anchor="w")
-            bar = tk.Frame(detail, bg=SIDE)
-            bar.pack(side="right", padx=24)
-            mac_first = g.get("mac") and (g.get("mac_installed") or not g.get("installed"))
-            if g.get("mac"):
-                button(bar, "▶  Play on Mac" if g.get("mac_installed") else "Get Mac Version",
-                       lambda: get_mac(item), mac_first).pack(side="left", padx=4)
-            if g.get("installed"):
-                button(bar, "▶  Play Windows Version" if g.get("mac") else "▶  Play", lambda: run_windows(item),
-                       not mac_first).pack(side="left", padx=4)
-            elif g.get("windows", True):
-                button(bar, ("Install Windows Version…" if g.get("mac") else "Install…") if store != "steam" else
-                       ("Install Windows Version in Steam" if g.get("mac") else "Install in Steam"),
-                       lambda: install_store_game(item), not mac_first).pack(side="left", padx=4)
-
-            def find_appid():  # umu matches other stores' games to Steam's, which Highball's database is keyed on
-                appid = umu_appid(store, gid)
-                ui(lambda: appid and info.winfo_exists() and verdict_label(info, appid))
-            threading.Thread(target=find_appid, daemon=True).start()
-            return
-        tk.Label(info, text=f"Bottle: {b}  ·  {ENGINE_NAMES[engine(b)]}  ·  graphics: {RENDERERS.get(graphics(b), graphics(b))}",
-                 bg=SIDE, fg=DIM).pack(anchor="w")
-        if own := set_game(b, target):
-            tk.Label(info, text="This game: " + ", ".join(f"{k} {v}" for k, v in own.items()), bg=SIDE, fg=DIM).pack(anchor="w")
-        if appid := steam_appid_of(b, title):
-            verdict_label(info, appid, b)
-            if appid in state.get("steam_mac", ()):
-                tk.Label(info, text="Has a Mac version on Steam", bg=SIDE, fg="#7fd88f").pack(anchor="w")
-        bar = tk.Frame(detail, bg=SIDE)
-        bar.pack(side="right", padx=24)
-        added = title in library().get(b, {})
-        files = target if not target.lower().endswith(".lnk") else str(win_to_mac(b, lnk_target(target) or "C:\\"))
-        if appid and appid in state.get("steam_mac", ()):
-            button(bar, "Get Mac Version", lambda: bg(f"{title}: Mac version…", lambda: ui(messagebox.showinfo, "Windows Portal", store_mac("steam", appid))),
-                   True).pack(side="left", padx=4)
-        for text, fn, acc in [("▶  Play", lambda: play(item), not (appid and appid in state.get("steam_mac", ()))),
-                              ("Game Settings…", lambda: game_settings_dialog(b, target, title), False),
-                              ("Make Mac App", lambda: messagebox.showinfo("Windows Portal", f"Created {mac_app(b, target, title)}"), False),
-                              ("Show Files", lambda: subprocess.run(["open", "-R", files]), False),
-                              (("Remove", lambda: (remove_program(b, title), refresh())) if added else
-                               ("Uninstall…", lambda: run(b, "uninstaller", wait=False))) + (False,)]:
-            button(bar, text, fn, acc).pack(side="left", padx=4)
-
-    # ---------- actions ----------
-    def do_install():
-        n = pick_bottle()
-        if not n:
-            return
-        top = tk.Toplevel(root)
-        top.title(f"Install into {n}")
-        lb = tk.Listbox(top, width=40, height=12)
-        lb.pack(padx=8, pady=8)
-        for k in catalog():
-            lb.insert("end", k)
-
-        def go():
-            if s := lb.curselection():
-                item = lb.get(s[0])
-                top.destroy()
-                bg(f"Installing {item} into {n}…", install, n, item)
-        def from_file():
-            f = filedialog.askopenfilename(parent=top, title=f"Install into {n}", filetypes=[
-                ("Installers and archives", " ".join(f"*{e}" for e in (".exe", ".msi", *ARCHIVES))), ("All", "*")])
-            if f:
-                top.destroy()
-                bg(f"Installing {Path(f).name} into {n}…", install_file, n, f)
-        row = tk.Frame(top)
-        row.pack(pady=(0, 8))
-        tk.Button(row, text="Install Selected", command=go).pack(side="left", padx=4)
-        tk.Button(row, text="Install from File…", command=from_file).pack(side="left", padx=4)
-
-    def do_add():
-        n = pick_bottle()
-        f = n and filedialog.askopenfilename(title=f"Add a program to {n}",
-                                             filetypes=[("Windows programs", "*.exe *.lnk *.bat"), ("All", "*")])
-        t = f and simpledialog.askstring("Add Program", "Name in library:", initialvalue=Path(f).stem)
-        if t:
-            add_program(n, f, t)
-            refresh()
-
-    def manage():
-        if state["manager"]:
-            return
-        top = tk.Toplevel(root)
-        top.title("Manage Bottles")
-        bl = tk.Listbox(top, width=24, height=16, exportselection=False)
-        bl.pack(side="left", fill="both", expand=True, padx=8, pady=8)
-        bar = tk.Frame(top)
-        bar.pack(side="right", fill="y", padx=8, pady=8)
-
-        def fill():
-            bl.delete(0, "end")
-            for b in bottles():
-                bl.insert("end", f"{b}  ({engine(b)}, {graphics(b)})")
-        state["manager"] = fill
-        top.protocol("WM_DELETE_WINDOW", lambda: (state.update(manager=None), top.destroy()))
-
-        def sel():
-            s = bl.curselection()
-            if not s:
-                messagebox.showinfo("Windows Portal", "Select a bottle first.", parent=top)
-            return bl.get(s[0]).rsplit("  (", 1)[0] if s else None
-
-        def do_new():
-            n = simpledialog.askstring("New bottle", "Bottle name:", parent=top)
-            v = n and simpledialog.askstring("New bottle", "Windows version (win10, win11, win7, winxp64…):",
-                                             initialvalue="win10", parent=top)
-            e = v and ask_engine(f"Engine for {n}", next((e for e in ("wine10", "wine") if ENGINES[e].exists()), "gptk"))
-            if e:
-                bg(f"Creating {n}…", new, n, v, e)
-
-        def ask_engine(title, current):
-            e = simpledialog.askstring(title, "Engine:\n" + "\n".join(f"  {k} = {v}" for k, v in ENGINE_NAMES.items()),
-                                       initialvalue=current, parent=top)
-            if e and e not in ENGINES:
-                messagebox.showerror("Windows Portal", f"Unknown engine {e!r}", parent=top)
-                return None
-            return e
-
-        def do_winver():
-            n = sel()
-            v = n and simpledialog.askstring(
-                f"Windows version for {n}", f"Currently: {winver(n)}\n\nNew version (win11, win10, win81, win7, winxp64…).\n"
-                "Restart the bottle's programs afterwards.", initialvalue="win10", parent=top)
-            if v:
-                bg(f"Setting {n} to {v}…", winver, n, v)
-
-        def do_keys():
-            n = sel()
-            on = n and messagebox.askyesnocancel(
-                f"Keyboard for {n}", f"Currently {keys(n)}.\n\nMake Command act as Ctrl (⌘C, ⌘V, ⌘A work) and Option as Alt?\n"
-                "No restores Wine's default, where Command acts as Alt. Restart the bottle's programs afterwards.", parent=top)
-            if on is not None:
-                bg(f"Updating {n}…", keys, n, on)
-
-        def do_graphics():
-            n = sel()
-            if not n:
-                return
-            opts = GRAPHICS[engine(n)]
-            g = simpledialog.askstring(f"Graphics for {n}", f"Currently: {graphics(n)}\n\n" + "\n".join(
-                f"  {o} = {RENDERERS[o]}" for o in opts) + ("\n\nDXMT and DXVK need the wine10 engine." if engine(n) == "gptk" else "")
-                + "\nRestart the bottle's programs afterwards.", initialvalue=graphics(n), parent=top)
-            if not g or g == graphics(n):
-                return
-            if g == "d3dmetal" and engine(n) == "wine10" and not d3dmetal_accepted():
-                if not messagebox.askyesno("D3DMetal license", D3DMETAL_LICENSE + "\n\nAccept?", parent=top):
-                    return
-                accept_d3dmetal(ask=False)
-            bg(f"Setting {n} to {g}…", set_graphics, n, g)
-
-        def do_sync():
-            n = sel()
-            m = n and simpledialog.askstring(
-                f"Sync mode for {n}", f"Currently: {sync_mode(n)}\n\nmsync: fastest for games\nesync: in between\n"
-                "none: needed for Steam's own window on this engine", initialvalue=sync_mode(n), parent=top)
-            if m:
-                bg(f"Setting {n} to {m}…", sync_mode, n, m)
-
-        def do_display():
-            n = sel()
-            m = n and simpledialog.askstring(
-                f"Display for {n}", f"Currently: {display(n)}\n\nstandard: Wine's default, fastest\nretina: full resolution, "
-                "sharp\ncompact: full resolution, smaller text\n\nRestart the bottle's programs afterwards.",
-                initialvalue=display(n), parent=top)
-            if m:
-                bg(f"Setting {n} to {m}…", display, n, m)
-
-        def do_engine():
-            n = sel()
-            e = n and ask_engine(f"Engine for {n}", engine(n))
-            if e and e != engine(n):
-                set_engine(n, e)
-                refresh()
-
-        def do_run():
-            n = sel()
-            exe = n and filedialog.askopenfilename(parent=top, filetypes=[("Windows programs", "*.exe *.msi *.bat *.lnk"), ("All", "*")])
-            if exe:
-                run(n, exe, wait=False)
-
-        def do_export():
-            n = sel()
-            d = n and filedialog.asksaveasfilename(parent=top, initialfile=f"{n}.tar.gz", filetypes=[("Bottle archive", "*.tar.gz")])
-            if d:
-                bg(f"Exporting {n}…", export, n, d.removesuffix(".tar.gz"))
-
-        def do_import():
-            f = filedialog.askopenfilename(parent=top, filetypes=[("Bottle archive", "*.tar.gz")])
-            if f:
-                bg("Importing…", import_, f)
-
-        def do_delete():
-            n = sel()
-            if n and messagebox.askyesno("Delete", f"Permanently delete bottle {n}, its Mac apps and everything installed in it?", parent=top):
-                state["filter"] = None if state["filter"] == n else state["filter"]
-                bg(f"Deleting {n}…", delete, n)
-
-        if not ENGINES["wine10"].exists():
-            tk.Button(bar, text="Get Wine 10 Engine", width=16, command=guarded(
-                lambda: bg("Downloading the Wine 10 engine (~250 MB)…", get_engine, "wine10"))).pack(pady=2)
-        if not ENGINES["arm64"].exists():
-            def get_native():
-                if why := arm64_missing():
-                    return messagebox.showinfo("Native engine", why[0].upper() + why[1:] + ".", parent=top)
-                if messagebox.askyesno("Native engine (preview)", "Wine built for Apple Silicon: Windows programs run "
-                                       "through FEX instead of Rosetta. Graphics are vkd3d-proton and DXVK only (no D3DMetal "
-                                       "or DXMT), so many games run slower than on wine10 for now. Bottles can't move to it: "
-                                       "make a new one.\n\nDownload it (~415 MB)?", parent=top):
-                    bg("Downloading the native engine (~415 MB)…", get_engine, "arm64")
-            tk.Button(bar, text="Get Native Engine…", width=16, command=guarded(get_native)).pack(pady=2)
-        for label, fn in [("New Bottle…", do_new),
-                          ("Run Program…", do_run),
-                          ("Open C: Drive", lambda: (n := sel()) and drive_c(n)),
-                          ("Engine…", do_engine),
-                          ("Windows Version…", do_winver),
-                          ("Graphics…", do_graphics),
-                          ("Sync Mode…", do_sync),
-                          ("Display…", do_display),
-                          ("Repair Steam", lambda: (n := sel()) and bg(f"Repairing Steam in {n}… (up to 3 minutes)",
-                                                                       lambda: ui(messagebox.showinfo, "Windows Portal", steam_repair(n)))),
-                          ("Mac Shortcuts…", do_keys),
-                          ("Wine Config", lambda: (n := sel()) and run(n, "winecfg", wait=False)),
-                          ("Winetricks", lambda: (n := sel()) and bg("Winetricks open…", tricks, n)),
-                          ("Force Quit", lambda: (n := sel()) and kill(n)),
-                          ("Export…", do_export),
-                          ("Import…", do_import),
-                          ("Delete Bottle", do_delete)]:
-            tk.Button(bar, text=label, width=16, command=guarded(fn)).pack(pady=2)
-        fill()
-
-    for text, fn, acc in [("Manage Bottles…", manage, False), ("Add Program…", do_add, False),
-                          ("Install Software…", do_install, True)]:
-        button(acts, text, fn, acc).pack(side="bottom", fill="x", pady=3)
-
-    def activated(e):  # coming back to the window (e.g. after installing in Steam) shows what changed
-        if e.widget is root and time.time() - state.get("last_refresh", 0) > 15 and not status.get():
-            refresh(store_view())
-    root.bind("<Activate>", activated)
-    refresh()
-    poll()
-    root.mainloop()
+def gui():
+    """Builds the app around this script (only when ui/ changed) and opens it."""
+    app = CACHE / "Windows Portal.app"
+    ui = sorted(Path(__file__).resolve().with_name("ui").glob("*.swift"))
+    exe = app / "Contents/MacOS/WindowsPortal"
+    if not exe.exists() or max(f.stat().st_mtime for f in ui) > exe.stat().st_mtime:
+        package(CACHE)
+    shutil.copy(__file__, app / "Contents/Resources/portal.py")
+    subprocess.run(["open", app])
 
 
 if __name__ == "__main__":
     cmd, *a = sys.argv[1:] or ["gui"]
-    cmds = {"gui": gui, "setup": setup, "package": package,
+    cmds = {"gui": gui, "serve": serve, "setup": setup, "package": package,
             "engine": lambda n, e=None: set_engine(n, e) if e else print(engine(n)),
             "winver": lambda n, v=None: print(winver(n, v)), "keys": lambda n, v=None: print(keys(n, v)),
             "store": store_cli, "get-engine": get_engine, "accept-d3dmetal": accept_d3dmetal,

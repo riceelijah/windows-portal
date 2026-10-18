@@ -1,6 +1,6 @@
 # Building a signed Windows Portal.app
 
-`scripts/build-app.sh` makes a real, shareable app: Python and Tk bundled with PyInstaller, signed with your
+`scripts/build-app.sh` makes a real, shareable app: a SwiftUI window over portal.py, Python bundled with PyInstaller, signed with your
 Developer ID, notarized, and carrying its own signed Wine loader for the native Apple Silicon engine. Without the
 steps below it still builds, as an ad-hoc signed app for your own Mac. Its native engine then falls back to
 Highball's loader.
@@ -9,7 +9,7 @@ Highball's loader.
 
 - **An Apple Silicon Mac** with **Xcode 26.4 or later**. The loader's link flag (`-x86_64_layout_emulation`) is new
   in that linker.
-- **A python3 with Tk.** python.org's installer includes it; with Homebrew, run `brew install python-tk`.
+- **python3** (3.11 or later). Xcode's Swift compiler builds the window.
 - **A paid Apple Developer Program membership** (US$99 a year). You need it for a Developer ID certificate,
   notarization and the cross-architecture capability.
 
@@ -73,5 +73,5 @@ Highball.app instead, the app's own helper isn't entitled. Check the profile, th
 - `helper/wineloader/main.c` is Wine's loader with Highball's two changes, LGPL-2.1-or-later (`COPYING.LIB`). The
   helper is a separate program inside the app, so its source must stay available, which this repository does.
 - PyInstaller's bootloader is GPL with an exception that allows bundling any program.
-- Python and Tk are under their own permissive licenses.
+- Python is under its own permissive license.
 - Engines, graphics layers and store tools are downloaded on demand, never bundled.
