@@ -24,21 +24,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension View {
-    /// Shows the model's alerts one at a time.
-    func questions(_ model: Model) -> some View {
-        @Bindable var model = model
-        let q = model.questions.first
-        return alert(q?.title ?? "", isPresented: .constant(q != nil), presenting: q) { q in
-            if q.text != nil { TextField("", text: $model.answerText) }
-            ForEach(q.buttons, id: \.self) { b in Button(b) { model.answer(b) } }
-            if q.cancel { Button("Cancel", role: .cancel) { model.answer(nil) } }
-        } message: { q in
-            Text(q.message)
-        }
-    }
+    /// Shows the model's questions one at a time.
+    func questions(_ model: Model, main: Bool = false) -> some View { modifier(Questions(model: model, main: main)) }
 
     @ViewBuilder func prominent(_ on: Bool) -> some View {
         if on { buttonStyle(.borderedProminent) } else { self }
+    }
+}
+
+/// The model's questions as a sheet, in the frontmost window only (each window carries this modifier); while the
+/// app is in the background, in the main window.
+/// A sheet, not an alert: alerts drop buttons (Cancel went missing) once there are a few.
+struct Questions: ViewModifier {
+    let model: Model
+    let main: Bool
+    @Environment(\.controlActiveState) private var active
+
+    func body(content: Content) -> some View {
+        let here = active == .key || (main && active == .inactive)
+        content.sheet(isPresented: .constant(model.questions.first != nil && here)) {
+            if let q = model.questions.first { QuestionView(q: q).environment(model) }
+        }
+    }
+}
+
+struct QuestionView: View {
+    @Environment(Model.self) private var model
+    let q: Question
+
+    var body: some View {
+        @Bindable var model = model
+        let choice = q.text == nil && q.buttons.count > 1  // pick one of several: buttons stack, full width
+        VStack(alignment: .leading, spacing: 12) {
+            Text(q.title).font(.headline)
+            if !q.message.isEmpty { Text(q.message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            if q.text != nil {
+                TextField("", text: $model.answerText).textFieldStyle(.roundedBorder).onSubmit { model.answer(q.buttons.first) }
+            }
+            if choice {
+                ForEach(q.buttons, id: \.self) { b in
+                    Button { model.answer(b) } label: { Text(b).frame(maxWidth: .infinity) }.controlSize(.large)
+                }
+            }
+            HStack {
+                Spacer()
+                if q.cancel { Button("Cancel", role: .cancel) { model.answer(nil) }.keyboardShortcut(.cancelAction) }
+                if !choice {
+                    ForEach(q.buttons, id: \.self) { b in Button(b) { model.answer(b) }.keyboardShortcut(.defaultAction) }
+                }
+            }
+        }
+        .padding(20).frame(width: 380)
     }
 }
 
@@ -82,7 +118,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $installing) { InstallSheet().environment(model) }
-        .questions(model)
+        .questions(model, main: true)
         .onChange(of: model.place) {
             model.selection = nil
             if case .store(let s)? = model.place { Task { await model.openStore(s) } }
@@ -114,8 +150,16 @@ struct Sidebar: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(model.tasks.values.sorted(), id: \.self) { t in
-                    HStack(spacing: 6) { ProgressView().controlSize(.small); Text(t).lineLimit(2) }
+                ForEach(model.tasks.sorted { $0.value.message < $1.value.message }, id: \.key) { id, t in
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(t.message).lineLimit(2)
+                        Spacer(minLength: 0)
+                        if t.cancellable {
+                            Button { model.cancel(id) } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.plain).foregroundStyle(.secondary).help("Cancel")
+                        }
+                    }
                 }
                 if let n = model.notice { Text(n).foregroundStyle(.secondary).lineLimit(3) }
             }
@@ -132,7 +176,7 @@ struct LibraryView: View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 14)], spacing: 14) {
                 ForEach(tiles) { t in
-                    TileView(tile: t, selected: model.selection == t.id).onAppear { model.wantArt(t) }
+                    TileView(tile: t, selected: model.selection == t.id).onAppear { model.wantArt(t); model.wantSize(t) }
                 }
             }
             .padding(20)
@@ -175,9 +219,10 @@ struct TileView: View {
             Thumb(path: tile.image).frame(width: 112, height: 112)
             Text(tile.title).font(.callout.weight(.semibold)).lineLimit(2).multilineTextAlignment(.center)
             Text(tile.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Text(tile.size.map(bytes) ?? " ").font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
         }
         .padding(10)
-        .frame(width: 160, height: 200, alignment: .top)
+        .frame(width: 160, height: 214, alignment: .top)
         .background(RoundedRectangle(cornerRadius: 10).fill(
             selected ? Color.accentColor.opacity(0.28) : Color.primary.opacity(hover ? 0.09 : 0.04)))
         .contentShape(RoundedRectangle(cornerRadius: 10))
@@ -225,9 +270,9 @@ struct DetailBar: View {
     var body: some View {
         HStack(spacing: 10) {
             if let t = tile, let p = t.program {
-                ProgramDetail(p: p).id(t.id)
+                ProgramDetail(p: p, size: t.size).id(t.id)
             } else if let t = tile, let s = t.store, let g = t.game {
-                GameDetail(store: s, g: g).id(t.id)
+                GameDetail(store: s, g: g, size: t.size).id(t.id)
             } else if case .store(let s)? = model.place {
                 StoreBar(store: s)
             } else {
@@ -244,6 +289,7 @@ struct DetailBar: View {
 struct ProgramDetail: View {
     @Environment(Model.self) private var model
     let p: Program
+    let size: Int64?
     @State private var d: Detail?
     @State private var verdict: Compat?
 
@@ -259,7 +305,8 @@ struct ProgramDetail: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(p.title).font(.title2.bold()).lineLimit(1)
             if let d {
-                Text("Bottle: \(p.bottle)  ·  \(d.engine)  ·  graphics: \(d.graphicsName)").foregroundStyle(.secondary)
+                Text((["Bottle: \(p.bottle)", d.engine, "graphics: \(d.graphicsName)"] + [size.map(bytes)].compactMap { $0 })
+                    .joined(separator: "  ·  ")).foregroundStyle(.secondary)
                 if !d.own.isEmpty {
                     Text("This game: " + d.own.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", "))
                         .foregroundStyle(.secondary)
@@ -273,8 +320,7 @@ struct ProgramDetail: View {
         if p.mac, let a = p.appid {
             Button("Get Mac Version") { model.say("\(p.title): Mac version…", "store_mac", ["steam", a]) }.prominent(true)
         }
-        Button("▶  Play") { model.play(Tile(id: "", title: p.title, subtitle: "", image: nil, program: p, store: nil, game: nil,
-                                            engine: "", mac: p.mac, installed: true, played: 0)) }
+        Button("▶  Play") { Task { await model.play(p) } }
             .prominent(!p.mac)
         if let d {
             Button("Game Settings…") { Task { await model.gameSettings(p, d) } }
@@ -308,6 +354,8 @@ struct GameDetail: View {
     @Environment(Model.self) private var model
     let store: String
     let g: StoreGame
+    let size: Int64?
+    @State private var download: Int64?  // not installed: what it downloads, asked of the store on selection
     @State private var verdict: Compat?
     @State private var looked = false
 
@@ -315,10 +363,15 @@ struct GameDetail: View {
         let macFirst = g.mac == true && (g.macInstalled == true || g.installed == nil)
         VStack(alignment: .leading, spacing: 3) {
             Text(g.title).font(.title2.bold()).lineLimit(1)
-            Text([storeName(store), g.installed ?? g.bottle].compactMap { $0 }.joined(separator: "  ·  ")).foregroundStyle(.secondary)
+            Text([storeName(store), g.installed ?? g.bottle, sizeText].compactMap { $0 }.joined(separator: "  ·  "))
+                .foregroundStyle(.secondary)
             CompatLine(verdict: verdict, pending: !looked)
         }
         .font(.callout)
+        .task {
+            if g.installed == nil && store != "steam",
+               let r = try? await model.backend.get(GameSize.self, "ui_game_size", [store, g.id]) { download = r.bytes }
+        }
         .task {
             // umu matches other stores' games to Steam's, which Highball's database is keyed on
             if let a = try? await model.backend.call("umu_appid", [store, g.id]) as? String {
@@ -339,6 +392,14 @@ struct GameDetail: View {
             }
             .prominent(!macFirst)
         }
+    }
+}
+
+extension GameDetail {
+    var sizeText: String? {
+        if g.installed != nil { return size.map { "\(bytes($0)) on disk" } }
+        if store == "steam" { return size.map { "about \(bytes($0)) to install" } }
+        return download.map { "\(bytes($0)) download" }
     }
 }
 
@@ -388,7 +449,7 @@ struct InstallSheet: View {
                     let exts = ["exe", "msi"] + (model.info?.archives ?? []).map { String($0.split(separator: ".").last ?? "") }
                     guard let url = model.choose("Install into \(bottle)", exts) else { return }
                     dismiss()
-                    model.launch("Installing \(url.lastPathComponent) into \(bottle)…", "install_file", [bottle, url.path])
+                    model.launch("Installing \(url.lastPathComponent) into \(bottle)…", "install_file", [bottle, url.path], cancellable: true)
                 }
                 .disabled(bottle.isEmpty)
                 Spacer()
@@ -396,7 +457,7 @@ struct InstallSheet: View {
                 Button("Install") {
                     guard let item else { return }
                     dismiss()
-                    model.launch("Installing \(item) into \(bottle)…", "install", [bottle, item])
+                    model.launch("Installing \(item) into \(bottle)…", "install", [bottle, item], cancellable: true)
                 }
                 .keyboardShortcut(.defaultAction).disabled(item == nil || bottle.isEmpty)
             }
@@ -423,11 +484,11 @@ struct BottlesView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Button("New Bottle…") { Task { await newBottle() } }
                     Button("Import…") {
-                        if let url = model.choose("Import a bottle", ["gz"]) { model.launch("Importing…", "import_", [url.path]) }
+                        if let url = model.choose("Import a bottle", ["gz"]) { model.launch("Importing…", "import_", [url.path], cancellable: true) }
                     }
                     if model.info?.engines["wine10"]?.installed == false {
                         Button("Get Wine 10 Engine") {
-                            model.launch("Downloading the Wine 10 engine (~250 MB)…", "get_engine", ["wine10"])
+                            model.launch("Downloading the Wine 10 engine (~250 MB)…", "get_engine", ["wine10"], cancellable: true)
                         }
                     }
                     if model.info?.engines["arm64"]?.installed == false { Button("Get Native Engine…") { Task { await native() } } }
@@ -450,7 +511,7 @@ struct BottlesView: View {
               let v = await model.ask("Windows version for \(n)", "", ["win11", "win10", "win7", "winxp64"]),
               let e = await model.ask("Engine for \(n)", "", engines.map(\.value.name)),
               let key = engines.first(where: { $0.value.name == e })?.key else { return }
-        await model.task("Creating \(n)…", "new", [n, v, key])
+        await model.task("Creating \(n)…", "new", [n, v, key], cancellable: true)
         selected = n
     }
 
@@ -460,7 +521,7 @@ struct BottlesView: View {
                               + "instead of Rosetta. Graphics are vkd3d-proton and DXVK only (no D3DMetal or DXMT), so many "
                               + "games run slower than on wine10 for now. Bottles can't move to it: make a new one.\n\n"
                               + "Download it (~415 MB)?", ["Download"]) != nil else { return }
-        await model.task("Downloading the native engine (~415 MB)…", "get_engine", ["arm64"])
+        await model.task("Downloading the native engine (~415 MB)…", "get_engine", ["arm64"], cancellable: true)
     }
 }
 
@@ -477,11 +538,13 @@ struct BottleForm: View {
     let name: String
     @State private var s: BottleSettings?
     @State private var wine: WineSettings?  // asked of Wine, so it arrives after the rest
+    @State private var size: Int64?
 
     var body: some View {
         Form {
             if let s {
                 Section("Settings (restart the bottle's programs afterwards)") {
+                    LabeledContent("Size on disk", value: size.map(bytes) ?? "Measuring…")
                     Picker("Engine", selection: bind(s.engine) { v in
                         await model.task("Switching \(name) to \(v)…", "set_engine", [name, v])
                     }) {
@@ -536,7 +599,8 @@ struct BottleForm: View {
                     tool("Wine Config") { await model.task("Opening Wine Config…", "run", [name, "winecfg"], kw: ["wait": false], reload: false) }
                     tool("Winetricks") { await model.task("Winetricks open…", "tricks", [name], reload: false) }
                     tool("Repair Steam") {
-                        if let text = await model.task("Repairing Steam in \(name)… (up to 3 minutes)", "steam_repair", [name], reload: false) as? String {
+                        if let text = await model.task("Repairing Steam in \(name)… (up to 3 minutes)", "steam_repair", [name],
+                                                       reload: false, cancellable: true) as? String {
                             await model.tell(text)
                         }
                     }
@@ -546,7 +610,7 @@ struct BottleForm: View {
                         panel.nameFieldStringValue = "\(name).tar.gz"
                         if panel.runModal() == .OK, let url = panel.url {
                             let dest = url.path.hasSuffix(".tar.gz") ? String(url.path.dropLast(7)) : url.path
-                            await model.task("Exporting \(name)…", "export", [name, dest], reload: false)
+                            await model.task("Exporting \(name)…", "export", [name, dest], reload: false, cancellable: true)
                         }
                     }
                     tool("Delete Bottle…", role: .destructive) {
@@ -562,6 +626,7 @@ struct BottleForm: View {
         }
         .formStyle(.grouped)
         .task { await load() }
+        .task { size = (try? await model.backend.call("ui_bottle_size", [name]) as? NSNumber)?.int64Value }
     }
 
     private func load() async {

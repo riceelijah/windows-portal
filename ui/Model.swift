@@ -30,8 +30,13 @@ struct StoreGame: Decodable, Hashable {
     let id, title: String
     let bottle, installed, art: String?
     let mac, macInstalled, windows: Bool?
+    let size: Int64?  // Steam's, from the list; other stores' are asked for (ui_game_size)
     var played: Double
 }
+
+struct GameSize: Decodable { let bytes: Int64?; let download: Bool }
+
+func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
 
 struct StoreLib: Decodable { let connected: Bool; var games: [StoreGame] }
 
@@ -60,7 +65,11 @@ struct Tile: Identifiable {
     let engine: String  // for the engine filters
     let mac, installed: Bool
     let played: Double
+    let size: Int64?
 }
+
+/// Something running, shown in the sidebar; a cancellable one runs in its own worker process.
+struct Running { let message: String; let cancellable: Bool }
 
 /// An alert waiting for an answer: buttons to pick from, or a text field when `text` is set.
 struct Question {
@@ -79,13 +88,15 @@ struct Question {
     var art: [String: String] = [:]  // tile id -> cover, as covers arrive
     var place: Place? = .all
     var selection: String?
-    var tasks: [UUID: String] = [:]  // what's running, for the sidebar
+    var tasks: [UUID: Running] = [:]  // what's running, for the sidebar
+    var sizes: [String: Int64] = [:]  // tile id -> bytes on disk, as they're measured
     var notice: String?
     var questions: [Question] = []
     var answerText = ""
     var lastRefresh = Date.distantPast
     private var fetched: Set<String> = []  // stores whose live list was asked for since the last Refresh
     private var artAsked: Set<String> = []
+    private var sizeAsked: Set<String> = []
     let backend = Backend.shared
 
     init() { Task { await refresh() } }
@@ -129,6 +140,22 @@ struct Question {
         }
     }
 
+    /// What a tile takes on disk: library programs and installed store games are measured (du) as they appear.
+    func wantSize(_ t: Tile) {
+        guard t.size == nil, !sizeAsked.contains(t.id) else { return }
+        let call: (String, [Any])
+        if let p = t.program { call = ("ui_program_size", [p.bottle, p.target]) }
+        else if let s = t.store, let g = t.game, s != "steam", g.installed != nil { call = ("ui_game_size", [s, g.id]) }
+        else { return }
+        sizeAsked.insert(t.id)
+        Task {
+            let r = try? await backend.call(call.0, call.1)
+            if let n = (r as? NSNumber)?.int64Value ?? ((r as? [String: Any])?["bytes"] as? NSNumber)?.int64Value {
+                sizes[t.id] = n
+            }
+        }
+    }
+
     // ---------- tiles ----------
     var title: String {
         switch place {
@@ -154,12 +181,13 @@ struct Question {
                 let id = "\(s)|\(g.id)"
                 return Tile(id: id, title: g.title, subtitle: status(g), image: g.art ?? art[id], program: nil, store: s,
                             game: g, engine: "", mac: g.mac == true, installed: g.installed != nil || g.macInstalled == true,
-                            played: g.played)
+                            played: g.played, size: g.size ?? sizes[id])
             }
         }
         return programs.filter { currentBottle == nil || $0.bottle == currentBottle }.map { p in
-            Tile(id: "\(p.bottle)|\(p.target)", title: p.title, subtitle: p.bottle, image: p.icon, program: p, store: nil,
-                 game: nil, engine: engineName(p.bottle), mac: p.mac, installed: true, played: p.played)
+            let id = "\(p.bottle)|\(p.target)"
+            return Tile(id: id, title: p.title, subtitle: p.bottle, image: p.icon, program: p, store: nil, game: nil,
+                        engine: engineName(p.bottle), mac: p.mac, installed: true, played: p.played, size: sizes[id])
         }
     }
 
@@ -171,7 +199,7 @@ struct Question {
 
     var isStore: Bool { if case .store? = place { true } else { false } }
 
-    var sorts: [String] { ["Name A–Z", "Name Z–A", "Recently played", isStore ? "Installed first" : "Bottle"] }
+    var sorts: [String] { ["Name A–Z", "Name Z–A", "Recently played", "Largest first", isStore ? "Installed first" : "Bottle"] }
 
     /// Filter checkboxes stack: within a group a tile passes if any ticked box fits it, across groups it must pass each.
     var filterGroups: [[String]] {
@@ -198,6 +226,7 @@ struct Question {
         switch sort {
         case "Name Z–A": return keep.sorted { name($0) > name($1) }
         case "Recently played": return keep.sorted { ($0.played, name($1)) > ($1.played, name($0)) }
+        case "Largest first": return keep.sorted { ($0.size ?? -1, name($1)) > ($1.size ?? -1, name($0)) }
         case "Installed first": return keep.sorted { ($0.installed ? 0 : 1, name($0)) < ($1.installed ? 0 : 1, name($1)) }
         case "Bottle": return keep.sorted { ($0.subtitle.lowercased(), name($0)) < ($1.subtitle.lowercased(), name($1)) }
         default: return keep.sorted { name($0) < name($1) }
@@ -205,29 +234,43 @@ struct Question {
     }
 
     // ---------- running things ----------
-    private func begin(_ message: String) -> UUID {
+    private func begin(_ message: String, cancellable: Bool = false) -> UUID {
         let id = UUID()
-        tasks[id] = message
+        tasks[id] = Running(message: message, cancellable: cancellable)
         return id
     }
 
     /// Runs a backend call with `message` in the sidebar; errors become an alert. Reloads the library afterwards.
+    /// cancellable: installs and downloads, which get a cancel button.
     @discardableResult
-    func task(_ message: String, _ call: String, _ args: [Any] = [], kw: [String: Any] = [:], reload: Bool = true) async -> Any? {
-        let id = begin(message)
+    func task(_ message: String, _ call: String, _ args: [Any] = [], kw: [String: Any] = [:], reload: Bool = true,
+              cancellable: Bool = false) async -> Any? {
+        let id = begin(message, cancellable: cancellable)
         defer { tasks[id] = nil }
         do {
-            let r = try await backend.call(call, args, kw: kw)
+            let r = try await backend.call(call, args, kw: kw, job: cancellable ? id.uuidString : nil)
             if reload { await refresh() }
             return r
         } catch {
-            await tell(error.localizedDescription)
+            if error.localizedDescription == "Cancelled" {
+                notice = "Cancelled: \(message)"
+                if reload { await refresh() }
+            } else {
+                await tell(error.localizedDescription)
+            }
             return nil
         }
     }
 
-    func launch(_ message: String, _ call: String, _ args: [Any] = [], kw: [String: Any] = [:], reload: Bool = true) {
-        Task { await task(message, call, args, kw: kw, reload: reload) }
+    func launch(_ message: String, _ call: String, _ args: [Any] = [], kw: [String: Any] = [:], reload: Bool = true,
+                cancellable: Bool = false) {
+        Task { await task(message, call, args, kw: kw, reload: reload, cancellable: cancellable) }
+    }
+
+    func cancel(_ id: UUID) {
+        guard let r = tasks[id] else { return }
+        tasks[id] = Running(message: "Cancelling: \(r.message)", cancellable: false)
+        Task { _ = try? await backend.call("cancel", [id.uuidString]) }
     }
 
     /// Like launch, then shows the message the call returns.
@@ -281,7 +324,7 @@ struct Question {
         }
     }
 
-    private func play(_ p: Program) async {
+    func play(_ p: Program) async {
         var r = await task("Starting \(p.title)…", "ui_play", [p.bottle, p.target, p.title], reload: false) as? [String: Any]
         if let why = r?["blocked"] as? String {
             guard await ask("Windows Portal", "Highball's database says \(p.title) won't run under Wine on a Mac: \(why).\n\n"
@@ -317,9 +360,9 @@ struct Question {
 
     func install(_ s: String, _ g: StoreGame) async {
         if s == "steam", let b = g.bottle {  // Steam downloads it in the bottle it's owned in
-            await task("Opening Steam to install \(g.title)…", "store_install", [s, g.id, b])
+            await task("Opening Steam to install \(g.title)…", "store_install", [s, g.id, b], cancellable: true)
         } else if let b = await pickBottle("Install \(g.title) into which bottle?") {
-            await task("Installing \(g.title) into \(b)… (large games take a while)", "store_install", [s, g.id, b])
+            await task("Installing \(g.title) into \(b)… (large games take a while)", "store_install", [s, g.id, b], cancellable: true)
             await openStore(s, reload: true)
         }
     }

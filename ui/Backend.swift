@@ -64,8 +64,9 @@ final class Backend: @unchecked Sendable {
         for c in all { c.resume(throwing: BackendError(message: "Windows Portal's backend stopped. Reopen the app.")) }
     }
 
-    /// Calls a function serve() exposes; resolves with its JSON result.
-    func call(_ name: String, _ args: [Any] = [], kw: [String: Any] = [:]) async throws -> Any {
+    /// Calls a function serve() exposes; resolves with its JSON result. With a job id it runs in its own worker
+    /// process, which call("cancel", [job]) stops.
+    func call(_ name: String, _ args: [Any] = [], kw: [String: Any] = [:], job: String? = nil) async throws -> Any {
         try await withCheckedThrowingContinuation { c in
             lock.lock()
             defer { lock.unlock() }
@@ -75,7 +76,9 @@ final class Backend: @unchecked Sendable {
             next += 1
             waiting[next] = c
             do {
-                var line = try JSONSerialization.data(withJSONObject: ["id": next, "call": name, "args": args, "kw": kw])
+                var req: [String: Any] = ["id": next, "call": name, "args": args, "kw": kw]
+                if let job { req["job"] = job }
+                var line = try JSONSerialization.data(withJSONObject: req)
                 line.append(10)
                 try input.fileHandleForWriting.write(contentsOf: line)
             } catch {

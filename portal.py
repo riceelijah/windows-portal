@@ -46,7 +46,7 @@ Every bottle is 64-bit and runs 32-bit programs too (WoW64); this Wine can't mak
 Add your own installers to ~/Library/Application Support/WindowsPortal/catalog.json:
   {"My App": {"url": "https://.../setup.exe", "file": "myapp-setup.exe", "tricks": ["vcrun2022"]}}
 """
-import base64, hashlib, json, os, platform, re, struct, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile
+import base64, hashlib, json, os, platform, re, signal, struct, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -595,7 +595,7 @@ def fix_steam(name):
 def steam_appid(name, target):
     """Steam's app id if target is a game under the bottle's Steam library, else None."""
     p = str(Path(target).resolve())
-    return next((a for a, _, folder, _ in steam_games(name) if p.startswith(f"{folder.resolve()}/")), None) \
+    return next((a for a, _, folder, *_ in steam_games(name) if p.startswith(f"{folder.resolve()}/")), None) \
         if "/steamapps/common/" in p else None
 
 
@@ -856,7 +856,7 @@ def vdf_pairs(path):
 
 
 def steam_games(name):
-    """[(appid, title, game folder, last updated)] for games Steam has fully installed in a bottle."""
+    """[(appid, title, game folder, last updated, bytes on disk)] for games Steam has fully installed in a bottle."""
     root = bottle(name) / "drive_c/Program Files (x86)/Steam/steamapps"
     libs = {root.resolve()}  # resolve: C: is reachable as both drive_c and dosdevices/c:
     if (root / "libraryfolders.vdf").exists():
@@ -868,7 +868,8 @@ def steam_games(name):
             for k, v in vdf_pairs(acf):
                 d.setdefault(k, v)  # top-level keys come first; nested sections may reuse names
             if int(d.get("StateFlags", 0)) & 4 and not d.get("name", "").startswith(("Steamworks", "Steam Linux", "Proton")):
-                games.append((d["appid"], d["name"], lib / "common" / d["installdir"], d.get("LastUpdated", "")))
+                games.append((d["appid"], d["name"], lib / "common" / d["installdir"], d.get("LastUpdated", ""),
+                              int(d.get("SizeOnDisk") or 0)))
     return games
 
 
@@ -1150,12 +1151,11 @@ def store_list(store, refresh=True):
     if store == "steam":  # read from disk, so always fresh
         games, on_mac = {}, mac_steam_installed()
         for b in bottles():
-            installed = {a for a, *_ in steam_games(b)} if (steam_root(b) / "steamapps").is_dir() else set()
-            mac = steam_mac_ids(b)
-            for appid, title in steam_owned(b).items():
+            installed = {g[0]: g[4] for g in steam_games(b)} if (steam_root(b) / "steamapps").is_dir() else {}
+            for appid, g in steam_owned(b).items():
                 if appid not in games or appid in installed:  # owned in several bottles: the one it's installed in
-                    games[appid] = {"title": title, "bottle": b, "installed": b if appid in installed else None,
-                                    "mac": appid in mac, "mac_installed": appid in on_mac}
+                    games[appid] = {**g, "bottle": b, "installed": b if appid in installed else None,
+                                    "mac_installed": appid in on_mac, "size": installed.get(appid) or g["size"]}
         return games
     if not refresh or not store_connected(store):
         return store_file(f"{store}-library.json")
@@ -1253,20 +1253,13 @@ def steam_root(name):
 
 
 def steam_owned(name):
-    """{appid: title} of games the account signed in to a bottle's Steam owns: appcache/librarycache has a folder
-    (older clients: files) per owned app, and appinfo.vdf says which are games."""
+    """{appid: {"title", "mac", "size"}} of games the account signed in to a bottle's Steam owns: appcache/librarycache
+    has a folder (older clients: files) per owned app, and appinfo.vdf says which are games, their OSes and sizes."""
     cache = steam_root(name) / "appcache/librarycache"
     ids = {int(m.group()) for p in cache.iterdir() if (m := re.match(r"\d+", p.name))} if cache.is_dir() else set()
     info = steam_appinfo(steam_root(name) / "appcache/appinfo.vdf", ids) if ids else {}
-    return {str(a): t for a, (t, kind, _) in sorted(info.items(), key=lambda i: str(i[1][0]).lower()) if kind == "game" and t}
-
-
-def steam_mac_ids(name):
-    """App ids, among what a bottle's Steam has seen, that Steam lists for macOS."""
-    cache = steam_root(name) / "appcache/librarycache"
-    ids = {int(m.group()) for p in cache.iterdir() if (m := re.match(r"\d+", p.name))} if cache.is_dir() else set()
-    info = steam_appinfo(steam_root(name) / "appcache/appinfo.vdf", ids) if ids else {}
-    return {str(a) for a, (_, _, oslist) in info.items() if "macos" in oslist}
+    return {str(a): {"title": t, "mac": "macos" in oslist, "size": size}
+            for a, (t, kind, oslist, size) in sorted(info.items(), key=lambda i: str(i[1][0]).lower()) if kind == "game" and t}
 
 
 MAC_STEAM = Path.home() / "Library/Application Support/Steam"  # the native Mac Steam client's data
@@ -1293,7 +1286,8 @@ def mac_steam_installed():
 
 
 def steam_appinfo(path, wanted):
-    """{appid: (name, type)} from Steam's binary appinfo.vdf (formats 28 and 29), for the appids in wanted."""
+    """{appid: (name, type, oslist, size)} from Steam's binary appinfo.vdf (formats 28 and 29), for the appids in
+    wanted. size: about how much installs, from the Windows depots in the default language (Steam may skip some)."""
     try:
         b = Path(path).read_bytes()
     except OSError:
@@ -1359,7 +1353,12 @@ def _appinfo(b, wanted):
                 # build, started by a .sh script, that no macOS since Catalina runs; anything else listed is trusted.
                 if mac_exes and all(e.endswith(".sh") for e in mac_exes) and str(common.get("osarch", "")) != "64":
                     oslist = oslist.replace("macos", "")
-                apps[appid] = (common.get("name"), str(common.get("type", "")).lower(), oslist)
+                size = sum(int(((d.get("manifests") or {}).get("public") or {}).get("size", 0) or 0)
+                           for k, d in (ai.get("depots") or {}).items() if k.isdigit() and isinstance(d, dict)
+                           and "windows" in str((d.get("config") or {}).get("oslist", "windows"))
+                           and str((d.get("config") or {}).get("language", "")) in ("", "english")
+                           and not d.get("dlcappid") and not {"optionaldlc", "lowviolence"} & set(d.get("config") or {}))
+                apps[appid] = (common.get("name"), str(common.get("type", "")).lower(), oslist, size)
             except (ValueError, IndexError, struct.error, AttributeError):
                 pass  # one odd entry shouldn't hide the rest of the library
     return apps
@@ -1405,7 +1404,9 @@ def epic_list():
     mac = {g["app_name"] for g in legendary_json("list", "--platform", "Mac", "--json") or []}
     mac_done = {app for app, (path, _) in epic_installed().items() if not where.get(app)}  # installed outside any bottle
     return {g["app_name"]: {"title": g.get("app_title") or g["app_name"], "installed": where.get(g["app_name"]),
-                            "mac": g["app_name"] in mac, "mac_installed": g["app_name"] in mac_done}
+                            "mac": g["app_name"] in mac, "mac_installed": g["app_name"] in mac_done,
+                            "cover": next((i["url"] for i in (g.get("metadata") or {}).get("keyImages", [])
+                                           if i.get("type") == "DieselGameBoxTall"), None)}
             for g in legendary_json("list", "--platform", "Windows", "--json") or []}
 
 
@@ -1501,7 +1502,7 @@ def itch_list():
         for k in keys:
             g = k.get("game") or {}
             games[str(k["id"])] = {"title": g.get("title", "?"), "game_id": k.get("game_id", g.get("id")), "windows": itch_windows(g),
-                                   "mac": itch_mac(g), "url": g.get("url")}
+                                   "mac": itch_mac(g), "url": g.get("url"), "cover": g.get("cover_url")}
     return games
 
 
@@ -1556,7 +1557,8 @@ def amazon_list():
     installed = {g["id"]: g["path"] for g in nile_file("installed") if os.path.isdir(g.get("path", ""))}
     where = {gid: next((b for b in bottles() if str(Path(path).resolve()).startswith(f"{(HOME / b / 'drive_c').resolve()}/")), None)
              for gid, path in installed.items()}
-    return {g["product"]["id"]: {"title": g["product"].get("title") or g["product"]["id"], "installed": where.get(g["product"]["id"])}
+    return {g["product"]["id"]: {"title": g["product"].get("title") or g["product"]["id"], "installed": where.get(g["product"]["id"]),
+                                 "cover": (g["product"].get("productDetail") or {}).get("iconUrl")}
             for g in nile_file("library") if g.get("product", {}).get("id")}
 
 
@@ -1588,14 +1590,24 @@ def amazon_launch(name, gid, *extra):
 UMU_STORES = {"epic": "egs", "gog": "gog", "amazon": "amazon", "itch": "itchio"}
 
 
+_umu_lock = threading.Lock()
+
+
+def _read_json(f):
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return {}  # missing, or left half-written by an older version: start over
+
+
 def umu_appid(store, gid):
     """Steam app id of a game from another store, via the umu database (github.com/Open-Wine-Components/umu-database),
     which Heroic, Lutris and Bottles share. Its ids are umu-<Steam app id> for games that are also on Steam."""
     if store == "steam":
         return gid
-    cache = CACHE / "umu.json"
-    known = json.loads(cache.read_text()) if cache.exists() else {}
-    key = f"{store}:{gid}"
+    cache, key = CACHE / "umu.json", f"{store}:{gid}"
+    with _umu_lock:
+        known = _read_json(cache)
     if key not in known:
         try:
             hits = http_json("https://umu.openwinecomponents.org/umu_api.php?" + urllib.parse.urlencode(
@@ -1603,9 +1615,12 @@ def umu_appid(store, gid):
         except (OSError, ValueError):
             return None  # offline: ask again next time
         m = re.fullmatch(r"umu-(\d+)", (hits or [{}])[0].get("umu_id") or "")
-        known[key] = m.group(1) if m else None
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(known))
+        with _umu_lock:  # covers load on several threads: re-read, add ours, replace the file whole
+            known = {**_read_json(cache), key: m.group(1) if m else None}
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".tmp")
+            tmp.write_text(json.dumps(known))
+            tmp.replace(cache)
     return known[key]
 
 
@@ -1616,35 +1631,59 @@ def art_key(key=None):
 
 
 def cover_art(store, gid, title, fetch=True):
-    """Cached PNG cover (portrait, 128 px tall) for a store game, or None."""
+    """Cached PNG cover (256 px tall) for a store game, or None."""
     out = CACHE / "art" / f"{store}-{re.sub(r'[^A-Za-z0-9_.-]', '_', str(gid))}.png"
     miss = out.with_suffix(".none")
     if out.exists() or not fetch or (miss.exists() and time.time() - miss.stat().st_mtime < 7 * 86400):
         return out if out.exists() else None
     out.parent.mkdir(parents=True, exist_ok=True)
-    src = None
-    try:
-        if appid := umu_appid(store, gid):
-            src = f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"
-        elif key := store_file("art.json").get("steamgriddb"):
-            auth = {"Authorization": f"Bearer {key}"}
-            found = http_json("https://www.steamgriddb.com/api/v2/search/autocomplete/" + urllib.parse.quote(title), auth).get("data")
-            if found:
-                grids = http_json(f"https://www.steamgriddb.com/api/v2/grids/game/{found[0]['id']}?dimensions=600x900", auth).get("data")
-                src = grids[0]["url"] if grids else None
-        if src:
+    for src in cover_sources(store, gid, title):
+        try:
             tmp = out.with_suffix(".jpg")
-            with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "WindowsPortal"}), timeout=30) as r:
-                tmp.write_bytes(r.read())
-            ok = subprocess.run(["sips", "-s", "format", "png", "--resampleHeight", "128", str(tmp), "--out", str(out)],
+            if src.startswith("http"):
+                with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "WindowsPortal"}), timeout=30) as r:
+                    tmp.write_bytes(r.read())
+            else:  # Steam's own copy on disk
+                shutil.copyfile(src, tmp)
+            ok = subprocess.run(["sips", "-s", "format", "png", "--resampleHeight", "256", str(tmp), "--out", str(out)],
                                 capture_output=True).returncode == 0
             tmp.unlink(missing_ok=True)
             if ok:
                 return out
-    except (OSError, ValueError, KeyError, IndexError):
-        pass
+        except (OSError, ValueError, KeyError, IndexError):
+            pass  # next source
     miss.touch()  # don't ask again for a week
     return None
+
+
+def cover_sources(store, gid, title):
+    """Where a cover might be, best first (a generator: later ones are only looked up if earlier ones fail)."""
+    appid = umu_appid(store, gid)
+    if appid:  # Steam's client keeps its artwork; it has covers the CDN's old addresses no longer serve
+        for b in bottles():
+            cache = steam_root(b) / "appcache/librarycache" / str(appid)
+            for name in ("library_600x900*.jpg", "library_capsule*.jpg", "header.jpg"):
+                yield from map(str, sorted(cache.rglob(name)) if cache.is_dir() else [])
+    if cover := (store_list(store, refresh=False).get(str(gid)) or {}).get("cover"):
+        yield cover
+    if store == "gog":
+        try:
+            if href := (http_json(f"https://api.gog.com/v2/games/{gid}").get("_links") or {}).get("boxArtImage", {}).get("href"):
+                yield href
+        except (OSError, ValueError):
+            pass
+    if appid:
+        yield f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"
+        yield f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"
+    if key := store_file("art.json").get("steamgriddb"):
+        auth = {"Authorization": f"Bearer {key}"}
+        try:
+            found = http_json("https://www.steamgriddb.com/api/v2/search/autocomplete/" + urllib.parse.quote(title), auth).get("data")
+            grids = found and http_json(f"https://www.steamgriddb.com/api/v2/grids/game/{found[0]['id']}?dimensions=600x900", auth).get("data")
+        except (OSError, ValueError):
+            grids = None
+        if grids:
+            yield grids[0]["url"]
 
 
 def store_cli(cmd, *a):
@@ -1968,6 +2007,88 @@ def ui_store_play(store, gid):
     store_play(store, gid)
 
 
+_size_slots = threading.BoundedSemaphore(3)  # tiles ask for sizes as they scroll into view: a few du's at a time
+_size_lock = threading.Lock()
+_sizes = None  # path -> [bytes, when measured], from CACHE/sizes.json
+
+
+def folder_size(path, max_age=86400):
+    """Bytes a folder takes on disk (du), remembered for a day: measuring a big game reads every file."""
+    global _sizes
+    path = str(Path(path).resolve())
+    with _size_lock:
+        if _sizes is None:
+            f = CACHE / "sizes.json"
+            _sizes = json.loads(f.read_text()) if f.exists() else {}
+        hit = _sizes.get(path)
+    if hit and time.time() - hit[1] < max_age:
+        return hit[0]
+    with _size_slots:
+        out = subprocess.run(["du", "-sk", path], capture_output=True, text=True).stdout.split()
+    n = int(out[0]) * 1024 if out else None
+    with _size_lock:
+        _sizes[path] = [n, time.time()]
+        CACHE.mkdir(parents=True, exist_ok=True)
+        (CACHE / "sizes.json").write_text(json.dumps(_sizes))
+    return n
+
+
+def install_folder(name, target):
+    """The folder a program was installed into: the one under Program Files, C:\\Games or Steam's common folder
+    that holds it, else the program's own folder."""
+    p = target
+    if p.lower().endswith(".lnk"):
+        if not (w := lnk_target(p)):
+            return None
+        p = str(win_to_mac(name, w))
+    parts = Path(p).parts
+    tops = [i for i, x in enumerate(parts[:-2]) if x.lower() in ("program files", "program files (x86)", "games", "common")]
+    folder = Path(*parts[:tops[-1] + 2]) if tops else Path(p).parent
+    return folder if folder.is_dir() else None
+
+
+def gog_bytes(text):
+    """GOG's sizes are text, e.g. "1.2 GB"."""
+    n, unit = (text.split() + ["B"])[:2]
+    return int(float(n) * 1024 ** "B KB MB GB TB".split().index(unit.upper())) if unit.upper() in "B KB MB GB TB".split() else 0
+
+
+def ui_program_size(name, target):
+    f = install_folder(name, target)
+    return folder_size(f) if f else None
+
+
+def ui_game_size(store, gid):
+    """{"bytes", "download"}: what an installed store game takes on disk, else its download (asks the store)."""
+    gid = str(gid)
+    g = store_list(store, refresh=False).get(gid) or {}
+    if store == "steam":
+        return {"bytes": g.get("size"), "download": False}
+    if g.get("installed"):
+        r = store_file("installed.json").get(f"{store}:{gid}") or {}
+        folder = ((epic_installed().get(gid) or (None,))[0] if store == "epic" else
+                  next((x["path"] for x in nile_file("installed") if x["id"] == gid), None) if store == "amazon" else
+                  install_folder(r["bottle"], r["target"]) if r.get("target") else None)
+        return {"bytes": folder_size(folder), "download": False} if folder else None
+    if store == "epic":
+        m = (legendary_json("info", gid, "--platform", "Windows", "--json") or {}).get("manifest") or {}
+        return {"bytes": m.get("download_size"), "download": True} if m.get("download_size") else None
+    if store == "gog":
+        d = http_json(f"https://embed.gog.com/account/gameDetails/{gid}.json", gog_auth())
+        langs = {lang: files for lang, files in d.get("downloads", [])}
+        files = (langs.get("English") or next(iter(langs.values()), {})).get("windows") or []
+        return {"bytes": sum(gog_bytes(f.get("size", "")) for f in files), "download": True} if files else None
+    if store == "itch":
+        ups = http_json(f"https://api.itch.io/games/{g['game_id']}/uploads?download_key_id={gid}", itch_auth()).get("uploads", [])
+        win = [u for u in ups if itch_windows(u) and not u.get("demo") and "demo" not in (u.get("traits") or [])]
+        return {"bytes": win[0].get("size"), "download": True} if win and win[0].get("size") else None
+    return None  # Amazon: Nile doesn't say before installing
+
+
+def ui_bottle_size(name):
+    return folder_size(bottle(name))
+
+
 def ui_bottle(name):
     """A bottle's settings for Manage Bottles, from its config (instant)."""
     eng = engine(name)
@@ -1980,30 +2101,95 @@ def ui_bottle_wine(name):
     return {"keys": keys(name), "winver": winver(name)}
 
 
+def api():
+    """What the app may call (serve() and its workers)."""
+    return {f.__name__: f for f in (
+        ui_info, ui_library, ui_store, ui_art, ui_art_key, ui_detail, ui_compat, ui_play, ui_store_play, ui_bottle,
+        ui_bottle_wine, ui_program_size, ui_game_size, ui_bottle_size, umu_appid, store_install, store_mac,
+        store_login_start, store_login, store_logout, set_game, accept_d3dmetal, install, install_file, add_program,
+        remove_program, mac_app, run, kill, new, winver, keys, set_graphics, sync_mode, display, set_engine, drive_c,
+        steam_repair, export, import_, delete, get_engine, tricks)}
+
+
+def answer(req):
+    """Runs one request: {"ok": result} or {"error": message}."""
+    try:
+        return {"ok": api()[req["call"]](*req.get("args", []), **req.get("kw", {}))}
+    except SystemExit as e:
+        return {"error": str(e.code or "failed")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def to_json(reply):
+    return json.dumps(reply, default=lambda o: str(o) if isinstance(o, Path) else None)
+
+
+def quiet_stdio():
+    """Takes over stdin/stdout for replies: print() and child processes go to stderr, and never read our input
+    (Wine's console reads its stdin). Returns (requests, replies)."""
+    requests, replies = os.fdopen(os.dup(0)), os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
+    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+    return requests, replies
+
+
+_jobs, _cancelled = {}, set()  # job id -> worker process; jobs asked to stop
+
+
+def cancel(job):
+    """Stops a job: its worker and everything it started (downloads, installers, Legendary...) share a process group."""
+    _cancelled.add(job)
+    if p := _jobs.get(job):
+        for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 0)):
+            try:
+                os.killpg(p.pid, sig)
+            except OSError:
+                return
+            try:
+                return p.wait(wait) if wait else None
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def run_job(job, req):
+    """Runs a request in its own worker process (portal.py worker), so cancel() can stop it."""
+    me = [sys.executable] + ([] if FROZEN else [str(Path(__file__).resolve())])
+    p = subprocess.Popen([*me, "worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True)
+    _jobs[job] = p
+    try:
+        out, _ = p.communicate(json.dumps(req))
+    finally:
+        _jobs.pop(job, None)
+    if job in _cancelled:
+        _cancelled.discard(job)
+        return {"error": "Cancelled"}
+    lines = out.strip().splitlines()
+    return json.loads(lines[-1]) if lines else {"error": f"stopped unexpectedly ({p.returncode})"}
+
+
+def worker():
+    requests, replies = quiet_stdio()
+    replies.write(to_json(answer(json.loads(requests.read()))) + "\n")
+
+
 def serve():
-    """JSON lines on stdin: {"id", "call", "args", "kw"}; answers {"id", "ok"} or {"id", "error"} on stdout. Each
-    call runs on its own thread, so a slow one (an install, a download) never holds up the rest."""
-    out, requests = os.fdopen(os.dup(1), "w"), os.fdopen(os.dup(0))
-    os.dup2(2, 1)  # print() and child processes go to stderr, never into the replies
-    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)  # and never read the requests: Wine's console reads its stdin
+    """JSON lines on stdin: {"id", "call", "args", "kw", "job"?}; answers {"id", "ok"} or {"id", "error"} on stdout.
+    Each call runs on its own thread, so a slow one never holds up the rest; one with a job id runs in a worker
+    process, which {"call": "cancel", "args": [job]} stops."""
+    requests, replies = quiet_stdio()
     lock = threading.Lock()
-    api = {f.__name__: f for f in (
-        ui_info, ui_library, ui_store, ui_art, ui_art_key, ui_detail, ui_compat, ui_play, ui_store_play, ui_bottle, ui_bottle_wine,
-        umu_appid, store_install, store_mac, store_login_start, store_login, store_logout, set_game, accept_d3dmetal,
-        install, install_file, add_program, remove_program, mac_app, run, kill, new, winver, keys, set_graphics,
-        sync_mode, display, set_engine, drive_c, steam_repair, export, import_, delete, get_engine, tricks)}
 
     def handle(req):
-        try:
-            reply = {"id": req["id"], "ok": api[req["call"]](*req.get("args", []), **req.get("kw", {}))}
-        except SystemExit as e:
-            reply = {"id": req["id"], "error": str(e.code or "failed")}
-        except Exception as e:
-            reply = {"id": req["id"], "error": f"{type(e).__name__}: {e}"}
-        line = json.dumps(reply, default=lambda o: str(o) if isinstance(o, Path) else None)
+        if req["call"] == "cancel":
+            reply = {"ok": cancel(*req["args"]) and None}
+        elif req.get("job"):
+            reply = run_job(req["job"], {k: req[k] for k in ("call", "args", "kw") if k in req})
+        else:
+            reply = answer(req)
         with lock:
-            out.write(line + "\n")
-            out.flush()
+            replies.write(to_json({"id": req["id"], **reply}) + "\n")
+            replies.flush()
     for line in requests:  # closes when the app quits; calls still running (an install) finish first
         threading.Thread(target=handle, args=(json.loads(line),)).start()
 
@@ -2021,7 +2207,7 @@ def gui():
 
 if __name__ == "__main__":
     cmd, *a = sys.argv[1:] or ["gui"]
-    cmds = {"gui": gui, "serve": serve, "setup": setup, "package": package,
+    cmds = {"gui": gui, "serve": serve, "worker": worker, "setup": setup, "package": package,
             "engine": lambda n, e=None: set_engine(n, e) if e else print(engine(n)),
             "winver": lambda n, v=None: print(winver(n, v)), "keys": lambda n, v=None: print(keys(n, v)),
             "store": store_cli, "get-engine": get_engine, "accept-d3dmetal": accept_d3dmetal,
