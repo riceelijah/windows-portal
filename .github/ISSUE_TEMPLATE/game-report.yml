@@ -1,0 +1,37 @@
+# Report… in the library prefills this from the answer you gave when the game closed (python3 portal.py report-url).
+name: Game report
+description: How a game ran in Windows Portal, so others know what to expect
+title: "Game report: "
+labels: [game-report]
+body:
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Title, and its Steam app id if it has one
+      placeholder: Deadlock (Steam 1422450)
+    validations:
+      required: true
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: How did it run?
+      options:
+        - Smooth
+        - Has issues
+        - Didn't run
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Setup
+      description: Engine, graphics layer, macOS version and Mac, as the library shows them
+      placeholder: Wine 10 (DXMT, D3DMetal, DXVK) · graphics dxmt · macOS 26.1 · Apple M3
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: What went wrong, what fixed it, settings or launch arguments you changed

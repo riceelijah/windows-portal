@@ -11,6 +11,14 @@ before launching one that can't run, and sends games the database says run best 
 Curated entries are CC0; entries marked "prediction" are derived from ProtonDB (ODbL) and only odds, not a Mac
 verification. Lookups are cached for a week in `~/Library/Caches/WindowsPortal/compat`.
 
+[Bridgeplay](https://bridgeplay.dev)'s tested list is the second source: games its maintainer ran on WineCX with
+Apple's D3DMetal, which often covers new DirectX 12 games before Highball rates them. When Highball has no curated
+entry, its result is the verdict shown ("Runs perfectly on D3DMetal (Bridgeplay's test)"), and `compat` prints both.
+
+When a game you launched from the library closes, Windows Portal asks once how it ran (Smooth, Has issues, Didn't
+run) and remembers the answer with the engine and graphics layer, on this Mac only (`python3 portal.py reports`).
+Report… on the game's page drafts a GitHub issue from it, so what you found can reach others.
+
 ## Keyboard
 
 New bottles map Command to Ctrl (so ⌘C / ⌘V / ⌘A work in Windows apps) and Option to Alt.
@@ -67,9 +75,25 @@ Epic's in `…/WindowsPortal/legendary`. Disconnect removes them.
 - **Repair Steam** (`python3 portal.py steam-repair NAME`): stops everything in the bottle, clears Steam's web
   cache, removes a steam.cfg that blocks its self-update, starts Steam and checks its window comes up.
 - **Force Quit** now also stops processes that outlive Wine's own shutdown, so nothing keeps running after a game.
+- **Built-in fixes** for Steam games that need one, keyed on app id and applied when the game starts from the
+  library: Deadlock's crackling audio and black Vulkan screen, Mortal Kombat 1's dead controllers, Resident Evil
+  Requiem hiding DLSS under Wine, CONTROL Resonant's broken models on Metal 4, It Takes Two's shader stutter. Games
+  that can't run (ray tracing only, VR only) get a warning before launch. The game's page shows what applies;
+  `python3 portal.py compat GAME` prints it with its source. Your own go in
+  `~/Library/Application Support/WindowsPortal/gamefixes.json`, keyed the same way, and win per game:
+  `{"1422450": {"args": ["-dx11"], "env": {"SteamDeck": "1"}, "graphics": "d3dmetal", "note": "why"}}`.
+- **More per game** (Game Settings…, or `python3 portal.py game NAME PROGRAM SETTING VALUE`): `args "-dx11"` adds
+  launch arguments (Steam passes them on too); `hud on` shows Metal's performance HUD; `upscale on` turns on MetalFX
+  spatial upscaling for DXMT (render lower, show sharp); `dlss on` makes D3DMetal report an NVIDIA RTX 4090 and
+  turns on Apple's nvapi64 and nvngx, so games offer DLSS and MetalFX answers it (Game Porting Toolkit 4's D3DMetal;
+  some games then take NVIDIA-only paths, so it's off by default); `env KEY=VALUE` sets a graphics layer's switch
+  (`D3DM_*`, `DXMT_*`, `DXVK_*`, `MVK_*`, `VKD3D_*`), `SteamDeck`, `WINEDEBUG` or Wine's memory knobs for one game.
+  Launch arguments always reach a Steam game; its environment and graphics layer do when launching it starts Steam.
 
 Display profiles, per-game mouse settings and Steam repair are adapted from
-[Mac Wine Launcher](https://github.com/MrBurge2000/mac-wine-launcher) (MIT).
+[Mac Wine Launcher](https://github.com/MrBurge2000/mac-wine-launcher) (MIT). The per-game fixes, the DLSS and
+MetalFX switches and the post-game report follow [Bridgeplay](https://github.com/raymondchins/Bridgeplay) (GPL-3.0),
+as ideas and facts, not code. Everything this runs on, with licenses, is in [docs/third-party.md](docs/third-party.md).
 
 ## Native Apple Silicon engine (preview, optional)
 
