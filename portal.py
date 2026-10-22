@@ -13,13 +13,16 @@
   python3 portal.py accept-d3dmetal        # read and accept Apple's license, needed for d3dmetal on wine10
   python3 portal.py sync NAME [MODE]       # wine10 bottles: msync (fastest, default), esync or none (Steam's window)
   python3 portal.py display NAME [MODE]    # standard, retina (sharp, full resolution) or compact (retina, smaller text)
-  python3 portal.py game NAME PROGRAM [SETTING VALUE]  # per-game: graphics LAYER|default, mouse enable|force|disable|default
+  python3 portal.py game NAME PROGRAM [SETTING VALUE]  # per-game: graphics LAYER|default, mouse enable|force|disable|default,
+                                           # args "-dx11", hud|dlss|upscale on|off, env KEY=VALUE (KEY= removes)
+  python3 portal.py report NAME PROGRAM smooth|issues|failed [NOTE]  # how a game ran; the GUI asks when one closes
+  python3 portal.py reports                # what you've reported; report-url NAME PROGRAM drafts a GitHub issue
   python3 portal.py steam-repair NAME      # stop everything in the bottle, clear Steam's web cache, start Steam, check it
   python3 portal.py copy-games FROM TO     # clone C:\\Games into another bottle (e.g. a new native one)
   python3 portal.py art-key KEY            # SteamGridDB API key, for cover art of games not on Steam
   python3 portal.py winver NAME [WINVER]   # show or change the Windows version (restart its programs after)
   python3 portal.py keys NAME [on|off]     # Command as Ctrl, Option as Alt (Mac copy/paste); on for new bottles
-  python3 portal.py compat GAME            # will it run? Steam app id or title, from Highball's open database
+  python3 portal.py compat GAME            # will it run? Steam app id or title, from Highball's and Bridgeplay's lists
   python3 portal.py list
   python3 portal.py catalog                # software the installer knows about
   python3 portal.py install NAME ITEM      # catalog item, or a path to an .exe/.msi/zip/7z/rar
@@ -107,6 +110,45 @@ PINNED = {  # download: (url, sha256). Pinned, so a changed file is refused rath
 }
 D3DMETAL_LICENSE = ("D3DMetal is Apple's, from the Game Porting Toolkit. Apple's license allows non-commercial use only, "
                     "to develop, test or evaluate games on Apple hardware, and forbids modifying or redistributing it.")
+
+# Fixes for Steam games, keyed on app id, applied when the game starts from the library (and to its clone in the
+# GPTK bottle): launch arguments, environment, a graphics layer, or a warning shown before launch. Found by
+# Bridgeplay (github.com/raymondchins/Bridgeplay) and PCGamingWiki; each entry says where. Add your own with the
+# same shape in ~/Library/Application Support/WindowsPortal/gamefixes.json; its keys win per game:
+#   {"1422450": {"args": ["-dx11"], "env": {"SteamDeck": "1"}, "graphics": "d3dmetal", "note": "why"}}
+GAMEFIXES = {
+    "1422450": {"title": "Deadlock", "args": ["-dx11", "+snd_autodetect_latency", "0", "+snd_mixahead", "0.05"],
+                "note": "Direct3D 11 (its Vulkan path through MoltenVK shows a black screen) and a fixed 50 ms sound "
+                        "mix-ahead: the 1 ms Source 2 autodetects under Wine crackles",
+                "source": "Bridgeplay gamefixes/1422450.conf"},
+    "1426210": {"title": "It Takes Two", "args": ["-dx11"], "note": "stops shader compilation stutter",
+                "source": "https://www.pcgamingwiki.com/wiki/It_Takes_Two"},
+    "1971870": {"title": "Mortal Kombat 1", "env": {"SteamDeck": "1"},
+                "note": "controllers do nothing in game unless it believes it's on a Steam Deck",
+                "source": "GE-Proton 10-10 release notes; Bridgeplay gamefixes/1971870.conf"},
+    "3669870": {"title": "CONTROL Resonant", "env": {"D3DM_MTL4": "0"},
+                "note": "D3DMetal's Metal 4 path draws broken 3D models; this keeps it on Metal 3",
+                "source": "Bridgeplay gamefixes/3669870.conf"},
+    "3764200": {"title": "Resident Evil Requiem", "args": ["/WineDetectionEnabled:False"],
+                "note": "RE Engine hides DLSS and XeSS when it detects Wine",
+                "source": "Bridgeplay gamefixes/3764200.conf"},
+    "3017860": {"title": "DOOM: The Dark Ages", "source": "Bridgeplay compat/games.json",
+                "warn": "needs hardware ray tracing, which MoltenVK doesn't expose; Bridgeplay found it won't start"},
+    "2677660": {"title": "Indiana Jones and the Great Circle", "source": "Bridgeplay compat/games.json",
+                "warn": "needs hardware ray tracing, which MoltenVK doesn't expose; Bridgeplay found it won't start"},
+    "546560": {"title": "Half-Life: Alyx", "warn": "VR only", "source": "Bridgeplay compat/games.json"},
+}
+# Environment a game's own settings may set (python3 portal.py game NAME PROGRAM env KEY=VALUE): the graphics layers'
+# switches, Metal's HUD, Wine's debugging and memory knobs, what Steam games read. Nothing that picks another Wine.
+GAME_ENV = ("D3DM_", "DXMT_", "DXVK_", "MVK_", "VKD3D_", "MTL_HUD_ENABLED", "WINEDEBUG", "WINE_LARGE_ADDRESS_AWARE",
+            "WINE_CPU_TOPOLOGY", "SteamDeck", "ROSETTA_ADVERTISE_AVX")
+GAME_SWITCHES = {  # per-game on/off settings, and what each does when on
+    "hud": "Metal's performance HUD over the game (MTL_HUD_ENABLED=1).",
+    "dlss": "DLSS, answered by MetalFX: the game sees an NVIDIA RTX 4090 and Apple's nvapi64 and nvngx answer it. "
+            "Needs D3DMetal from Game Porting Toolkit 4. Off by default: some games then take NVIDIA-only paths.",
+    "upscale": "MetalFX spatial upscaling of DXMT's swap chain (DXMT_METALFX_SPATIAL_SWAPCHAIN=1): the game renders "
+               "at a lower resolution and is shown sharp.",
+}
 
 CATALOG = {
     "Steam": {"url": "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe", "file": "SteamSetup.exe", "engine": "wine", "args": ["/S"]},
@@ -217,15 +259,91 @@ def game_settings(name, target):
     return cfg(name).get("games", {}).get(program_exe(name, target).lower(), {})
 
 
+def gamefix(appid):
+    """The fix for a Steam app id: the built-in one with the keys of your gamefixes.json entry on top; {} if none."""
+    if not appid:
+        return {}
+    f = DATA / "gamefixes.json"
+    try:
+        mine = json.loads(f.read_text()) if f.exists() else {}
+    except ValueError:
+        mine = {}
+    return {**GAMEFIXES.get(str(appid), {}), **(mine.get(str(appid)) or {})}
+
+
+def appid_for(name, target):
+    """Steam app id of a program: a game under the bottle's Steam library, or a clone with steam_appid.txt beside its
+    exe (steam-sync leaves one); else None."""
+    if appid := steam_appid(name, target):
+        return appid
+    marker = Path(str(target)).parent / "steam_appid.txt" if "/" in str(target) else None
+    try:
+        return (marker.read_text().strip() or None) if marker and marker.is_file() else None
+    except OSError:
+        return None
+
+
+def game_layer(name, target=None):
+    """The graphics layer a program runs with: its own setting, else its Steam fix's, else the bottle's. Per-game
+    layers ride in the environment, which wine10's layers (folders of DLLs) are picked from."""
+    if target and engine(name) == "wine10":
+        for want in (game_settings(name, target).get("graphics"), gamefix(appid_for(name, target)).get("graphics")):
+            if want in GRAPHICS["wine10"] and (want != "d3dmetal" or d3dmetal_accepted()):
+                return want
+    return graphics(name)
+
+
+def game_env(name, target):
+    """({env}, [DLL overrides], [args]) a program adds to its bottle's: its Steam fix first, then its own settings."""
+    fix, own = gamefix(appid_for(name, target)), game_settings(name, target)
+    env, overrides, args = dict(fix.get("env") or {}), [], list(fix.get("args") or [])
+    layer = game_layer(name, target)
+    if own.get("hud") == "on":
+        env["MTL_HUD_ENABLED"] = "1"
+    if own.get("upscale") == "on" and layer == "dxmt":
+        env["DXMT_METALFX_SPATIAL_SWAPCHAIN"] = "1"
+    if own.get("dlss") == "on" and layer == "d3dmetal":
+        # Games offer DLSS only on an NVIDIA adapter, so D3DMetal reports one (an RTX 4090's IDs), and Apple's nvapi64
+        # and nvngx, Game Porting Toolkit 4's answer to DLSS through MetalFX, are turned on for this game.
+        for k, v in (("D3DM_VENDOR_ID", "0x10de"), ("D3DM_DEVICE_ID", "0x2684"),
+                     ("D3DM_DEVICE_DESCRIPTION", "NVIDIA GeForce RTX 4090")):
+            env.setdefault(k, v)
+        overrides.append("nvapi64,nvngx=b")
+    env.update(own.get("env") or {})  # a variable set by hand wins over the switches and the fix
+    if own.get("args"):
+        args += shlex.split(own["args"])
+    return env, overrides, args
+
+
+def describe_fix(fix):
+    """'-dx11 SteamDeck=1 graphics d3dmetal: why' for a game's fix; '' if it only warns or is empty."""
+    bits = [*fix.get("args", []), *(f"{k}={v}" for k, v in (fix.get("env") or {}).items())]
+    if fix.get("graphics"):
+        bits.append(f"graphics {fix['graphics']}")
+    return (" ".join(bits) + (f": {fix['note']}" if fix.get("note") else "")) if bits else ""
+
+
+def describe_game(name, target):
+    """One line of what a program runs with beyond its bottle's settings: its own, then its fix; '' if nothing."""
+    own = game_settings(name, target)
+    parts = [f"{k} {v}" for k, v in own.items() if k != "env"] + [f"{k}={v}" for k, v in (own.get("env") or {}).items()]
+    if fix := describe_fix(gamefix(appid_for(name, target))):
+        parts.append("built-in fix " + fix)
+    return ", ".join(parts)
+
+
 def set_game(name, target, setting=None, value=None):
     """Per-game settings, keyed on the program's .exe so they also apply when Steam or a launcher starts it:
-    graphics (a layer, or default for the bottle's) and mouse (enable, force or disable warping the pointer:
-    try force for games whose camera spins or that lose the mouse; default resets)."""
+    graphics (a layer, or default for the bottle's), mouse (enable, force or disable warping the pointer: try force
+    for games whose camera spins or that lose the mouse), args (launch arguments, quoted as one string), hud, dlss
+    and upscale (on or off, see GAME_SWITCHES) and env (KEY=VALUE; KEY= removes it). default resets a setting."""
     exe = program_exe(name, target)
     games = cfg(name).get("games", {})
     mine = games.get(exe.lower(), {})
     if not setting:
         return mine
+    if value is None:
+        sys.exit(f"{setting}: needs a value (default resets it)")
     app = rf"HKCU\Software\Wine\AppDefaults\{exe}"
     if setting == "graphics":
         if value != "default" and value not in GRAPHICS[engine(name)]:
@@ -243,8 +361,26 @@ def set_game(name, target, setting=None, value=None):
             reg(name, "delete", app + r"\DirectInput", "/v", "MouseWarpOverride", "/f")
         else:
             reg(name, "add", app + r"\DirectInput", "/v", "MouseWarpOverride", "/t", "REG_SZ", "/d", value, "/f")
+    elif setting == "args":
+        try:
+            shlex.split(value)
+        except ValueError as e:
+            sys.exit(f"args: {e}")
+    elif setting in GAME_SWITCHES:
+        if value not in ("on", "off", "default"):
+            sys.exit(f"{setting}: on, off or default")
+        value = "default" if value == "off" else value  # off is what a game gets with no setting
+    elif setting == "env":
+        if value != "default":
+            key, _, val = value.partition("=")
+            if "=" not in value or not key.startswith(GAME_ENV) or not val.isprintable():
+                sys.exit(f"env: KEY=VALUE, where KEY starts with one of {', '.join(GAME_ENV)}; KEY= removes it")
+            envs = {k: v for k, v in mine.get("env", {}).items() if k != key}
+            if val:
+                envs[key] = val
+            value = envs or "default"
     else:
-        sys.exit("game settings: graphics or mouse")
+        sys.exit("game settings: graphics, mouse, args, env, " + ", ".join(GAME_SWITCHES))
     if value == "default":
         mine.pop(setting, None)
     else:
@@ -348,18 +484,19 @@ def wine_env(name, target=None):
     # Speed/memory: no debug logging, esync/msync instead of wineserver round-trips for every lock,
     # no winemenubuilder (it spawns per install and litters ~/.local), AVX advertised to Rosetta for games.
     extra, overrides = engine_env(name, target)
+    own, own_overrides, _ = game_env(name, target) if target else ({}, [], [])  # the game's fix and settings win
     return {"WINEPREFIX": str(bottle(name)), "WINEDEBUG": "-all", "WINEESYNC": "1", "WINEMSYNC": "1",
             # gameoverlayrenderer: Steam's in-game overlay hangs games under Wine (Portal spun at 100% CPU, no window).
             # Steam passes its environment to the games it launches, so this covers them too.
             "WINEDLLOVERRIDES": ";".join([os.environ.get("WINEDLLOVERRIDES", "winemenubuilder.exe=d;gameoverlayrenderer=d"),
-                                          *overrides]),
-            **({} if engine(name) == "arm64" else {"ROSETTA_ADVERTISE_AVX": "1"}), **extra}
+                                          *overrides, *own_overrides]),
+            **({} if engine(name) == "arm64" else {"ROSETTA_ADVERTISE_AVX": "1"}), **extra, **own}
 
 
 def engine_env(name, target=None):
     """({env}, [DLL overrides]) for the bottle's engine and graphics layer, or the game's own layer on wine10."""
     eng, env, overrides = engine(name), {}, []
-    layer = (game_settings(name, target).get("graphics") if target and eng == "wine10" else None) or graphics(name)
+    layer = game_layer(name, target)
     if eng == "wine10":
         fw = SIK / "Frameworks"
         gst = fw / "GStreamer.framework/Versions/1.0/lib"
@@ -604,8 +741,9 @@ def run(name, exe, *args, wait=True):
         proc = (epic_launch if hit[0] == "epic" else amazon_launch)(name, hit[1], *args)
         return proc.wait() if wait else proc
     w, game = wine(name), exe
+    args = (*args, *game_env(name, exe)[2])  # the game's launch arguments: its fix's, then its own settings'
     if appid := steam_appid(name, exe):  # Steam games launch through Steam: it adds their launch options and DRM
-        exe, args = "steam.exe", ("-applaunch", appid, *args)
+        exe, args = "steam.exe", ("-applaunch", appid, *args)  # Steam hands what follows the app id to the game
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
         fix_steam(name)
         # ...but not before Steam's first update: with the flag, a fresh install shows "Fatal Error" and stops
@@ -934,6 +1072,14 @@ COMPAT_STATUS = {"verified-local": "Verified by Highball", "community": "Communi
                  "blocked-publisher": "Won't run: blocked by the publisher"}
 RENDERERS = {"d3dmetal": "D3DMetal (the gptk engine)", "dxmt": "DXMT", "dxvk": "DXVK", "wined3d": "WineD3D",
              "vkd3d": "vkd3d-proton (DirectX 12)"}
+# Bridgeplay's list (github.com/raymondchins/Bridgeplay, compat/games.json): games its maintainer ran on WineCX with
+# Apple's D3DMetal, a second opinion that often covers new DirectX 12 games before Highball rates them.
+BRIDGEPLAY_URL = "https://raw.githubusercontent.com/raymondchins/Bridgeplay/main/compat/games.json"
+BRIDGEPLAY_PAGE = "https://bridgeplay.dev/compatibility"
+BRIDGEPLAY_STATUS = {"platinum": "Runs perfectly", "gold": "Runs well", "silver": "Runs, minor issues",
+                     "bronze": "Runs, with issues", "borked": "Won't run"}
+REPORT_WORDS = {"smooth": "ran smoothly", "issues": "ran with issues", "failed": "didn't run"}
+ISSUES_URL = "https://github.com/riceelijah/windows-portal/issues/new"
 
 
 def compat_fetch(url, file, max_age=7 * 86400, cached_only=False):
@@ -956,9 +1102,32 @@ def compat_fetch(url, file, max_age=7 * 86400, cached_only=False):
     return data
 
 
+def bridgeplay(appid, cached_only=False):
+    """Bridgeplay's tested entry for a Steam app id, or None (its untested entries count as none)."""
+    games = compat_fetch(BRIDGEPLAY_URL, "bridgeplay.json", max_age=86400, cached_only=cached_only)
+    hit = next((g for g in games if str(g.get("appid")) == str(int(appid))), None) if isinstance(games, list) else None
+    return hit if hit and hit.get("status") in BRIDGEPLAY_STATUS else None
+
+
 def compat(appid, cached_only=False):
-    """Highball's entry for a Steam app id: {"game": {...}} curated, {"prediction": {...}} odds, or {} if unknown."""
-    return compat_fetch(COMPAT_URL.format(int(appid)), f"{int(appid)}.json", cached_only=cached_only) or {}
+    """What's known about a Steam app id: Highball's {"game": {...}} curated or {"prediction": {...}} odds, with
+    {"bridgeplay": {...}} when Bridgeplay tested it; {} if nothing."""
+    d = compat_fetch(COMPAT_URL.format(int(appid)), f"{int(appid)}.json", cached_only=cached_only) or {}
+    if bp := bridgeplay(appid, cached_only):
+        d = {**d, "bridgeplay": bp}
+    return d
+
+
+def compat_url(d):
+    return d.get("url") or (BRIDGEPLAY_PAGE if d.get("bridgeplay") else "https://gethighball.com/database/")
+
+
+def bridgeplay_verdict(bp):
+    s = BRIDGEPLAY_STATUS.get(bp["status"], bp["status"])
+    if bp["status"] == "borked":
+        return f"{s}: {bp['notes']} (Bridgeplay's test)" if bp.get("notes") else f"{s} (Bridgeplay's test)"
+    on = f" on {RENDERERS.get(bp['backend'], bp['backend']).split(' (')[0]}" if bp.get("backend") else ""
+    return f"{s}{on} (Bridgeplay's test)"
 
 
 def compat_verdict(d):
@@ -966,13 +1135,64 @@ def compat_verdict(d):
     if g := d.get("game"):
         line = COMPAT_STATUS.get(g.get("status"), g.get("status") or "Unknown")
         return line + (f" · best on {RENDERERS.get(g['renderer'], g['renderer'])}" if g.get("renderer") else "")
+    if bp := d.get("bridgeplay"):  # a run on a Mac beats odds from Linux reports
+        return bridgeplay_verdict(bp)
     if d.get("prediction"):
         return f"{d.get('label', d['prediction'].get('macPrediction'))} (prediction from Linux reports, ODbL)"
     return None
 
 
 def compat_blocked(d):
-    return (d.get("game") or {}).get("status", "").startswith("blocked")
+    return (d.get("game") or {}).get("status", "").startswith("blocked") or \
+        (not d.get("game") and (d.get("bridgeplay") or {}).get("status") == "borked")
+
+
+def reports():
+    f = DATA / "reports.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def report_key(name, target):
+    return appid_for(name, target) or program_exe(name, target).lower()
+
+
+def report(name, target, verdict, note="", title=None):
+    """Remembers how a game ran (smooth, issues or failed) and what it ran on, like Bridgeplay's one-tap report when
+    a game closes. It stays on this Mac; Report… in the library (or report-url) drafts a GitHub issue from it."""
+    if verdict not in REPORT_WORDS:
+        sys.exit(f"report: {', '.join(REPORT_WORDS)}")
+    try:
+        chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        chip = ""
+    r = reports()
+    r[report_key(name, target)] = {"title": title or Path(str(target)).stem, "verdict": verdict, "note": note,
+                                   "bottle": name, "engine": engine(name), "graphics": game_layer(name, target),
+                                   "when": time.strftime("%Y-%m-%d"), "macos": platform.mac_ver()[0] or platform.platform(),
+                                   "chip": chip or platform.machine()}
+    DATA.mkdir(parents=True, exist_ok=True)
+    (DATA / "reports.json").write_text(json.dumps(r, indent=1))
+    return r[report_key(name, target)]
+
+
+def report_text():
+    r = reports()
+    return "\n".join(f"{v['when']}\t{v['title']}\t{REPORT_WORDS.get(v['verdict'], v['verdict'])}\t{v['engine']}/{v['graphics']}"
+                     + (f"\t{v['note']}" if v.get("note") else "") for v in r.values()) or \
+        "No reports yet. Play a game and answer “How did it run?” when it closes, or: python3 portal.py report NAME PROGRAM smooth|issues|failed"
+
+
+def report_url(name, target):
+    """A GitHub issue for this project's game-report form, prefilled from the game's report."""
+    r = reports().get(report_key(name, target)) or {}
+    appid, title = appid_for(name, target), r.get("title") or Path(str(target)).stem
+    fields = {"template": "game-report.yml", "title": f"Game report: {title}",
+              "game": f"{title} (Steam {appid})" if appid else title,
+              "verdict": {"smooth": "Smooth", "issues": "Has issues", "failed": "Didn't run"}.get(r.get("verdict"), ""),
+              "setup": f"{ENGINE_NAMES[engine(name)]} · graphics {r.get('graphics') or game_layer(name, target)} · "
+                       f"macOS {r.get('macos') or platform.mac_ver()[0]} · {r.get('chip', '')}".rstrip(" ·"),
+              "notes": r.get("note", "")}
+    return ISSUES_URL + "?" + urllib.parse.urlencode({k: v for k, v in fields.items() if v})
 
 
 def compat_report(game):
@@ -990,19 +1210,33 @@ def compat_report(game):
         if len({a for _, a in hits}) > 1 and not exact:
             return "Which one?\n" + "\n".join(f"  {a}\t{t}" for t, a in dict.fromkeys(hits))
         game = (exact or hits)[0][1]
-    d = compat(game)
-    if not d:
-        return f"No data for Steam app {game} (or offline). Browse https://gethighball.com/database/"
-    g = d.get("game") or d.get("prediction", {})
-    lines = [f"{g.get('title', game)} (Steam {game}): {compat_verdict(d)}"]
+    d, fix = compat(game), gamefix(game)
+    if not d and not fix:
+        return f"No data for Steam app {game} (or offline). Browse https://gethighball.com/database/ and {BRIDGEPLAY_PAGE}"
+    g = d.get("game") or d.get("prediction") or {}
+    title = g.get("title") or (d.get("bridgeplay") or {}).get("name") or fix.get("title") or game
+    lines = [f"{title} (Steam {game}): {compat_verdict(d) or 'not in the compatibility databases'}"]
     if d.get("game"):
         lines += [f"  {g['notes']}"] if g.get("notes") else []
         lines += [f"  Known issue: {i['symptom']}\n    Fix: {i['fix']}" for i in g.get("knownIssues") or []]
         if g.get("anticheat"):
             lines.append(f"  Anti-cheat: {', '.join(g['anticheat'].get('names', []))}")
-    else:
+    elif d.get("prediction"):
         lines.append(f"  {d.get('note', '')} ProtonDB tier: {g.get('protonTier')}.")
-    lines.append(f"  {d.get('url', 'https://gethighball.com/database/')}  (data: {d.get('license')}, highball-db)")
+    if bp := d.get("bridgeplay"):
+        where = ", ".join(x for x in (bp.get("engine"), bp.get("tested_on"), bp.get("last_tested")) if x)
+        lines.append(f"  Bridgeplay: {bp['status']} on {bp.get('backend') or 'its engine'}" + (f" ({where})" if where else "")
+                     + (f": {bp['notes']}" if bp.get("notes") else ""))
+        if bp.get("anticheat") and bp["anticheat"] != "none known":
+            lines.append(f"  Anti-cheat: {bp['anticheat']}")
+    if fix.get("warn"):
+        lines.append(f"  Not expected to run: {fix['warn']}")
+    if describe_fix(fix):
+        lines.append(f"  Built-in fix: {describe_fix(fix)} ({fix.get('source', 'see GAMEFIXES')})")
+    if d.get("game") or d.get("prediction"):
+        lines.append(f"  {d.get('url', 'https://gethighball.com/database/')}  (data: {d.get('license')}, highball-db)")
+    if d.get("bridgeplay"):
+        lines.append(f"  {BRIDGEPLAY_PAGE}  (Bridgeplay's tests, GPL-3.0)")
     return "\n".join(lines)
 
 
@@ -1857,8 +2091,8 @@ def gui():
     root.configure(bg=BG)
     status = tk.StringVar()
     jobs = queue.Queue()  # worker threads never touch Tk; they post callables here
-    state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None,
-             "stores": {}, "store_fetched": set(), "art_asked": set()}  # filter ("store", key) shows that store's library
+    state = {"filter": None, "selected": None, "items": [], "tiles": [], "manager": None, "stores": {},
+             "store_fetched": set(), "art_asked": set(), "asked": set()}  # filter ("store", key) shows that store's library
     images = {}  # Tk forgets images Python garbage-collects, so keep refs
     prefs_file, played_file = DATA / "gui.json", DATA / "played.json"
     prefs = json.loads(prefs_file.read_text()) if prefs_file.exists() else {}
@@ -2225,13 +2459,62 @@ def gui():
             bg(f"Starting {title}…", store_play, store, gid)
             return
         appid = steam_appid_of(b, title)
-        if appid and compat_blocked(compat(appid, cached_only=True)) and not messagebox.askyesno(
-                "Windows Portal", f"Highball's database says {title} won't run under Wine on a Mac: "
-                f"{compat_verdict(compat(appid, cached_only=True))}.\n\nLaunch anyway?"):
+        d = compat(appid, cached_only=True) if appid else {}
+        warn = (compat_verdict(d) if compat_blocked(d) else None) or gamefix(appid).get("warn")
+        if warn and not messagebox.askyesno(
+                "Windows Portal", f"{title} isn't expected to run under Wine on a Mac: {warn}.\n\nLaunch anyway?"):
             return
         run(b, target, wait=False)
         status.set(f"Launched {title}")
         root.after(4000, lambda: status.get() == f"Launched {title}" and status.set(""))
+        if not steam_exe(b, target):  # a game, not Steam itself: ask how it ran once it closes
+            threading.Thread(target=watch_game, args=(item,), daemon=True).start()
+
+    def watch_game(item):
+        """Waits for the game's process to appear (Steam may start or update first) and go away, then asks how it ran."""
+        title, b, target, _ = item
+        exe = program_exe(b, target).lower()
+        if not exe.endswith(".exe") or exe in ("steam.exe", "uninstaller.exe"):
+            return
+
+        def running():
+            out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout.lower()
+            return exe in out
+        for _ in range(60):  # up to three minutes to show up
+            if running():
+                break
+            time.sleep(3)
+        else:
+            return
+        gone = 0
+        while gone < 2:  # two polls without it, so a launcher handing over to the game doesn't count as an exit
+            time.sleep(5)
+            gone = gone + 1 if not running() else 0
+        ui(ask_how_it_ran, item)
+
+    def ask_how_it_ran(item):
+        """Bridgeplay's one-tap report, kept on this Mac: once per game and engine/graphics layer."""
+        title, b, target, _ = item
+        key = report_key(b, target)
+        done = reports().get(key, {})
+        if key in state["asked"] or (done.get("engine"), done.get("graphics")) == (engine(b), game_layer(b, target)):
+            return
+        state["asked"].add(key)
+        top = tk.Toplevel(root)
+        top.title("Windows Portal")
+        tk.Label(top, text=f"How did {title} run?", font=("Helvetica", 14, "bold")).pack(padx=24, pady=(18, 4))
+        tk.Label(top, text="Remembered on this Mac with the engine and graphics layer it ran on.\n"
+                 "Report… on the game's page drafts a GitHub issue from it, to help others.").pack(padx=24)
+        bar = tk.Frame(top)
+        bar.pack(padx=24, pady=16)
+
+        def answer(v):
+            top.destroy()
+            if v:
+                report(b, target, v, title=title)
+                show_detail()
+        for text, v in (("Smooth", "smooth"), ("Has issues", "issues"), ("Didn't run", "failed"), ("Not now", None)):
+            tk.Button(bar, text=text, command=lambda v=v: answer(v)).pack(side="left", padx=4)
 
     def run_windows(item):  # the store game's Windows version, even when a Mac one exists
         title, _, (_, store, gid, g), _ = item
@@ -2311,34 +2594,83 @@ def gui():
 
         def shown(d):
             if verdict.winfo_exists():
-                best = (d.get("game") or {}).get("renderer")
+                best = (d.get("game") or {}).get("renderer") or (d.get("bridgeplay") or {}).get("backend")
                 hint = (f" (Graphics… to switch)" if b and best in GRAPHICS[engine(b)] and best != graphics(b) else
                         " (not on the native engine)" if b and engine(b) == "arm64" and best in ("d3dmetal", "dxmt") else "")
                 verdict.config(text=f"{compat_verdict(d) or 'Not in the compatibility database'}{hint}  ↗",
                                fg="#ff6b6b" if compat_blocked(d) else DIM)
-                verdict.bind("<Button-1>", lambda e: subprocess.run(["open", d.get("url", "https://gethighball.com/database/")]))
+                verdict.bind("<Button-1>", lambda e: subprocess.run(["open", compat_url(d)]))
         threading.Thread(target=lambda: ui(shown, compat(appid)), daemon=True).start()
 
     def game_settings_dialog(b, target, title):
-        now = set_game(b, target)
-        opts = GRAPHICS[engine(b)]
-        g = simpledialog.askstring(f"{title}: graphics", f"Graphics for this game only (bottle: {graphics(b)}).\n"
-                                   f"{', '.join(opts)}, or default for the bottle's.", initialvalue=now.get("graphics", "default"))
-        if g is None:
-            return
-        if g == "d3dmetal" and engine(b) == "wine10" and not d3dmetal_accepted():
-            if not messagebox.askyesno("D3DMetal license", D3DMETAL_LICENSE + "\n\nAccept?"):
-                return
-            accept_d3dmetal(ask=False)
-        m = simpledialog.askstring(f"{title}: mouse", "Mouse: default, or force for games whose camera spins or that "
-                                   "lose the pointer (enable, disable also work).", initialvalue=now.get("mouse", "default"))
-        if m is None:
-            return
+        now, eng = set_game(b, target), engine(b)
+        top = tk.Toplevel(root)
+        top.title(f"{title}: game settings")
+        rows = tk.Frame(top)
+        rows.pack(padx=16, pady=12)
+        values = {}
 
-        def apply():
-            set_game(b, target, "graphics", g.strip())
-            set_game(b, target, "mouse", m.strip())
-        bg(f"Saving settings for {title}…", apply)
+        def row(i, label, make, help_text):
+            tk.Label(rows, text=label).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            make().grid(row=i, column=1, sticky="w", pady=3)
+            tk.Label(rows, text=help_text, fg="gray40", wraplength=400, justify="left").grid(row=i, column=2, sticky="w", padx=8)
+
+        def menu(key, options):
+            values[key] = v = tk.StringVar(value=now.get(key, "default"))
+            return lambda: tk.OptionMenu(rows, v, *options)
+
+        def check(key):
+            values[key] = v = tk.StringVar(value=now.get(key, "off"))
+            return lambda: tk.Checkbutton(rows, variable=v, onvalue="on", offvalue="off")
+
+        def entry(key, text):
+            values[key] = v = tk.StringVar(value=text)
+            return lambda: tk.Entry(rows, textvariable=v, width=40)
+        row(0, "Graphics", menu("graphics", ["default", *GRAPHICS[eng]]),
+            f"This game only; default is the bottle's ({graphics(b)}). Per-game layers work on the wine10 and wine engines.")
+        row(1, "Mouse", menu("mouse", ["default", "force", "enable", "disable"]),
+            "force for games whose camera spins or that lose the pointer.")
+        row(2, "Metal HUD", check("hud"), GAME_SWITCHES["hud"])
+        if "d3dmetal" in GRAPHICS[eng]:
+            row(3, "DLSS → MetalFX", check("dlss"), GAME_SWITCHES["dlss"])
+        if "dxmt" in GRAPHICS[eng]:
+            row(4, "MetalFX upscaling", check("upscale"), GAME_SWITCHES["upscale"])
+        row(5, "Launch arguments", entry("args", now.get("args", "")),
+            "Added to the game's command line, through Steam too. For example -dx11.")
+        row(6, "Environment", entry("env", " ".join(f"{k}={v}" for k, v in now.get("env", {}).items())),
+            "KEY=VALUE pairs separated by spaces. Keys start with: " + ", ".join(GAME_ENV) + ".")
+        if fix := describe_fix(gamefix(appid_for(b, target))):
+            tk.Label(top, text="Built-in fix, applied as well: " + fix, fg="gray40", wraplength=720,
+                     justify="left").pack(padx=16, anchor="w")
+
+        def save():
+            vals = {k: v.get().strip() for k, v in values.items()}
+            if vals["graphics"] == "d3dmetal" and eng == "wine10" and not d3dmetal_accepted():
+                if not messagebox.askyesno("D3DMetal license", D3DMETAL_LICENSE + "\n\nAccept?", parent=top):
+                    return
+                accept_d3dmetal(ask=False)
+            try:
+                pairs = shlex.split(vals.pop("env"))
+                shlex.split(vals["args"])
+            except ValueError as e:
+                return messagebox.showerror("Windows Portal", f"Can't read that: {e}", parent=top)
+            if any("=" not in kv or not kv.startswith(GAME_ENV) for kv in pairs):
+                return messagebox.showerror("Windows Portal", "Environment: KEY=VALUE pairs, with KEY starting with one of "
+                                            + ", ".join(GAME_ENV), parent=top)
+            top.destroy()
+
+            def apply():
+                for k, v in vals.items():
+                    set_game(b, target, k, v or "default")
+                set_game(b, target, "env", "default")
+                for kv in pairs:
+                    set_game(b, target, "env", kv)
+                ui(show_detail)
+            bg(f"Saving settings for {title}…", apply)
+        bar = tk.Frame(top)
+        bar.pack(pady=(0, 12))
+        tk.Button(bar, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+        tk.Button(bar, text="Save", command=save).pack(side="left", padx=4)
 
     def show_detail():
         for w in detail.winfo_children():
@@ -2379,8 +2711,13 @@ def gui():
             return
         tk.Label(info, text=f"Bottle: {b}  ·  {ENGINE_NAMES[engine(b)]}  ·  graphics: {RENDERERS.get(graphics(b), graphics(b))}",
                  bg=SIDE, fg=DIM).pack(anchor="w")
-        if own := set_game(b, target):
-            tk.Label(info, text="This game: " + ", ".join(f"{k} {v}" for k, v in own.items()), bg=SIDE, fg=DIM).pack(anchor="w")
+        if what := describe_game(b, target):
+            tk.Label(info, text="This game: " + what, bg=SIDE, fg=DIM, wraplength=560, justify="left").pack(anchor="w")
+        if warn := gamefix(appid_for(b, target)).get("warn"):
+            tk.Label(info, text=f"Not expected to run: {warn}", bg=SIDE, fg="#ff6b6b", wraplength=560, justify="left").pack(anchor="w")
+        if rep := reports().get(report_key(b, target)):
+            tk.Label(info, text=f"You said it {REPORT_WORDS.get(rep['verdict'], rep['verdict'])} on {rep['engine']} / "
+                     f"{rep['graphics']}, {rep['when']}", bg=SIDE, fg=DIM).pack(anchor="w")
         if appid := steam_appid_of(b, title):
             verdict_label(info, appid, b)
             if appid in state.get("steam_mac", ()):
@@ -2394,6 +2731,7 @@ def gui():
                    True).pack(side="left", padx=4)
         for text, fn, acc in [("▶  Play", lambda: play(item), not (appid and appid in state.get("steam_mac", ()))),
                               ("Game Settings…", lambda: game_settings_dialog(b, target, title), False),
+                              ("Report…", lambda: subprocess.run(["open", report_url(b, target)]), False),
                               ("Make Mac App", lambda: messagebox.showinfo("Windows Portal", f"Created {mac_app(b, target, title)}"), False),
                               ("Show Files", lambda: subprocess.run(["open", "-R", files]), False),
                               (("Remove", lambda: (remove_program(b, title), refresh())) if added else
@@ -2609,6 +2947,8 @@ if __name__ == "__main__":
             "store": store_cli, "get-engine": get_engine, "accept-d3dmetal": accept_d3dmetal,
             "display": lambda n, m=None: print(display(n, m)), "copy-games": lambda s, d: print("\n".join(copy_games(s, d))), "steam-repair": lambda n: print(steam_repair(n)),
             "game": lambda n, prog, k=None, v=None: print(set_game(n, prog, k, v)), "art-key": lambda k=None: print(art_key(k)),
+            "report": lambda n, prog, v, *note: print(report(n, prog, v, " ".join(note))), "reports": lambda: print(report_text()),
+            "report-url": lambda n, prog: print(report_url(n, prog)),
             "graphics": lambda n, g=None: print(set_graphics(n, g) if g else graphics(n)),
             "sync": lambda n, m=None: print(sync_mode(n, m)),
             "compat": lambda g, *more: print(compat_report(" ".join((g, *more)))), "new": new, "run": run, "tricks": tricks, "install": install, "steam-sync": lambda: print(sync_steam()), "add": add_program, "remove": remove_program,
