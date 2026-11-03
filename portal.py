@@ -752,6 +752,12 @@ def guard_webhelper(name, secs=600):
     threading.Thread(target=watch, daemon=True).start()
 
 
+def steam_elsewhere(name):
+    """Another bottle whose Steam is running, or None. Two at once starve each other: on the native engine Steam then
+    restarts its webhelper every minute or so, redrawing its window each time."""
+    return next((b for b in bottles() if b != name and any(exe == "steam.exe" for _, exe, _ in procs(exe_pids(b)))), None)
+
+
 def steam_appid(name, target):
     """Steam's app id if target is a game under the bottle's Steam library, else None."""
     p = str(Path(target).resolve())
@@ -2272,11 +2278,14 @@ def ui_compat(appid, name=None):
             "url": d.get("url", "https://gethighball.com/database/")}
 
 
-def ui_play(name, target, title, force=False):
-    """Launches a library program; first returns {"blocked": verdict} if Highball says it can't run."""
+def ui_play(name, target, title, force=False, both=False):
+    """Launches a library program; first returns {"blocked": verdict} if Highball says it can't run, or
+    {"other_steam": bottle} if it starts Steam while another bottle's Steam runs (both is then the answer)."""
     appid = steam_appid_of(name, title)
     if not force and appid and compat_blocked(d := compat(appid, cached_only=True)):
         return {"blocked": compat_verdict(d)}
+    if not both and (steam_exe(name, target) or steam_appid(name, target)) and (other := steam_elsewhere(name)):
+        return {"other_steam": other}
     mark_played(f"{name}|{target}")
     run(name, target, wait=False)
     return {}
