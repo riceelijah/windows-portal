@@ -331,6 +331,14 @@ struct Question {
                             + "Launch anyway?", ["Launch Anyway"]) != nil else { return }
             r = await task("Starting \(p.title)…", "ui_play", [p.bottle, p.target, p.title, true], reload: false) as? [String: Any]
         }
+        if let other = r?["other_steam"] as? String {
+            guard let c = await ask("Windows Portal", "Steam is already running in \(other). Two Steams at once slow each "
+                                    + "other down, and on the native engine Steam's window keeps reloading.",
+                                    ["Quit It First", "Run Both"]) else { return }
+            if c == "Quit It First" { _ = await task("Stopping \(other)…", "kill", [other], reload: false) }
+            r = await task("Starting \(p.title)…", "ui_play", [p.bottle, p.target, p.title, true], kw: ["both": true],
+                           reload: false) as? [String: Any]
+        }
         if r != nil, let i = programs.firstIndex(of: p) { programs[i].played = Date.now.timeIntervalSince1970 }
     }
 
