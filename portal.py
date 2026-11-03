@@ -49,7 +49,7 @@ Every bottle is 64-bit and runs 32-bit programs too (WoW64); this Wine can't mak
 Add your own installers to ~/Library/Application Support/WindowsPortal/catalog.json:
   {"My App": {"url": "https://.../setup.exe", "file": "myapp-setup.exe", "tricks": ["vcrun2022"]}}
 """
-import base64, hashlib, json, os, platform, re, signal, struct, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile
+import base64, hashlib, json, os, platform, re, signal, struct, threading, time, zlib, plistlib, shlex, shutil, subprocess, sys, tarfile
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -285,10 +285,10 @@ def appid_for(name, target):
 
 def game_layer(name, target=None):
     """The graphics layer a program runs with: its own setting, else its Steam fix's, else the bottle's. Per-game
-    layers ride in the environment, which wine10's layers (folders of DLLs) are picked from."""
-    if target and engine(name) == "wine10":
+    layers ride in the environment, which wine10's and arm64's layers (folders of DLLs) are picked from."""
+    if target and (eng := engine(name)) in ("wine10", "arm64"):
         for want in (game_settings(name, target).get("graphics"), gamefix(appid_for(name, target)).get("graphics")):
-            if want in GRAPHICS["wine10"] and (want != "d3dmetal" or d3dmetal_accepted()):
+            if want in GRAPHICS[eng] and (want != "d3dmetal" or d3dmetal_accepted()):
                 return want
     return graphics(name)
 
@@ -369,6 +369,8 @@ def set_game(name, target, setting=None, value=None):
     elif setting in GAME_SWITCHES:
         if value not in ("on", "off", "default"):
             sys.exit(f"{setting}: on, off or default")
+        if value == "on" and (need := {"upscale": "dxmt", "dlss": "d3dmetal"}.get(setting)) not in (None, *GRAPHICS[engine(name)]):
+            sys.exit(f"{setting} needs {need}, which {ENGINE_NAMES[engine(name)]} doesn't have")
         value = "default" if value == "off" else value  # off is what a game gets with no setting
     elif setting == "env":
         if value != "default":
@@ -494,7 +496,7 @@ def wine_env(name, target=None):
 
 
 def engine_env(name, target=None):
-    """({env}, [DLL overrides]) for the bottle's engine and graphics layer, or the game's own layer on wine10."""
+    """({env}, [DLL overrides]) for the bottle's engine and graphics layer, or the game's own layer on wine10 or arm64."""
     eng, env, overrides = engine(name), {}, []
     layer = game_layer(name, target)
     if eng == "wine10":
@@ -729,6 +731,27 @@ def fix_steam(name):
         w.write_bytes(WEBHELPER)
 
 
+def guard_webhelper(name, secs=600):
+    """Steam updates itself after it starts and puts its real webhelper back, so its window stays black until the next
+    launch. For a while after launching Steam, puts the stand-in back and stops the real one; Steam restarts it."""
+    w = bottle(name) / "drive_c/Program Files (x86)/Steam/bin/cef/cef.win64/steamwebhelper.exe"
+
+    def watch():
+        end = time.time() + secs
+        while time.time() < end:
+            time.sleep(5)
+            if w.exists() and w.stat().st_size != len(WEBHELPER):
+                time.sleep(10)  # the update writes its files, then restarts Steam: let it finish
+                fix_steam(name)
+                for pid, exe, _ in procs(exe_pids(name)):
+                    if exe == "steamwebhelper.exe":
+                        try:
+                            os.kill(pid, 9)
+                        except OSError:
+                            pass
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def steam_appid(name, target):
     """Steam's app id if target is a game under the bottle's Steam library, else None."""
     p = str(Path(target).resolve())
@@ -747,12 +770,13 @@ def run(name, exe, *args, wait=True):
         exe, args = "steam.exe", ("-applaunch", appid, *args)  # Steam hands what follows the app id to the game
     if steam := steam_exe(name, exe):  # -noverifyfiles: else Steam "repairs" the stand-in at startup
         fix_steam(name)
+        guard_webhelper(name)
         # ...but not before Steam's first update: with the flag, a fresh install shows "Fatal Error" and stops
         exe, args = str(steam), (("-noverifyfiles",) if (steam.parent / "steamui.dll").exists() else ()) + steam_flags(name) + tuple(args)
     low = exe.lower()
     cmd = ([w, "msiexec", "/i", exe] if low.endswith(".msi") else
            [w, "start", "/unix", exe] if low.endswith(".lnk") else [w, exe])
-    # A game's own graphics layer (wine10) rides in the environment: through Steam it applies if this starts Steam.
+    # A game's own graphics layer (wine10, arm64) rides in the environment: through Steam it applies if this starts Steam.
     proc = subprocess.Popen([*cmd, *args], env=env(name, game), cwd=Path(exe).parent if os.path.exists(exe) else None)
     return proc.wait() if wait else proc
 
@@ -785,11 +809,33 @@ def kill(name):
         time.sleep(wait)
 
 
+# Windows programs that only serve others: Wine's services and Steam's helpers. Left alone, they mean what they served
+# has gone (a Steam that quit but whose webhelper hung keeps the wineserver up and its icons in the Dock).
+HELPERS = {"steamwebhelper.exe", "steamservice.exe", "steamerrorreporter.exe", "gameoverlayui.exe", "winedevice.exe",
+           "services.exe", "lsass.exe", "plugplay.exe", "svchost.exe", "rpcss.exe", "explorer.exe", "conhost.exe", "start.exe"}
+
+
 def reap(name):
-    """Kills Windows programs that outlived their bottle's wineserver (a hung Steam webhelper, a Steam whose wineserver
-    died): without it they can't run, and each sits in the Dock as a dead "wineloader"."""
-    if not wine_pids(name) and exe_pids(name):
+    """Kills Windows programs that outlived their bottle's wineserver (a Steam whose wineserver died: without it they
+    can't run, and each sits in the Dock as a dead "wineloader"), or that outlived what they served: only helpers
+    left, none started in the last minute (so a program that's still starting isn't caught)."""
+    if not (pids := exe_pids(name)):
+        return
+    if not wine_pids(name) or all(n in HELPERS and age > 60 for _, n, age in procs(pids)):
         kill(name)
+
+
+def procs(pids):
+    """(pid, lowercase .exe name, seconds running) for each pid still alive."""
+    out = subprocess.run(["ps", "-o", "pid=,etime=,command=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
+    res = []
+    for line in out.splitlines():
+        pid, etime, cmd = line.split(None, 2)
+        days, _, hms = etime.rpartition("-")
+        secs = sum(int(x) * 60 ** i for i, x in enumerate(reversed(hms.split(":")))) + int(days or 0) * 86400
+        exe = re.search(r"([^\\/]+\.exe)\b", cmd, re.I)
+        res.append((int(pid), (exe.group(1) if exe else cmd).lower(), secs))
+    return res
 
 
 def bottle_pids(name):
@@ -1040,7 +1086,6 @@ def unplace_steam_game(entry):
             shutil.rmtree(HOME / b / "drive_c/Games" / entry["dir"], ignore_errors=True)
 
 
-import threading
 _sync_lock = threading.Lock()  # the GUI refreshes from worker threads; two syncs must not clone over each other
 
 
@@ -2212,7 +2257,8 @@ def ui_art_key(key):
 def ui_detail(name, target, title):
     eng = engine(name)
     files = target if not target.lower().endswith(".lnk") else str(win_to_mac(name, lnk_target(target) or "C:\\"))
-    return {"engine": ENGINE_NAMES[eng], "graphics": graphics(name), "graphics_name": RENDERERS.get(graphics(name), graphics(name)),
+    layer = game_layer(name, target)  # what it runs with; "graphics" stays the bottle's, which the picker compares to
+    return {"engine": ENGINE_NAMES[eng], "graphics": graphics(name), "graphics_name": RENDERERS.get(layer, layer),
             "options": GRAPHICS[eng], "own": set_game(name, target), "added": title in library().get(name, {}), "files": files}
 
 
